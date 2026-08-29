@@ -175,6 +175,7 @@ def long_assets_ui() -> Dict[str, Any]:
     with c3:
         st.markdown('##### Channel Logo / Watermark Overlay <span class="badge-optional">Optional</span>', unsafe_allow_html=True)
         watermark = st.file_uploader("Upload Watermark PNG", type=["png"], key="long_watermark")
+        wm_opacity = st.slider("Watermark Opacity", 0.3, 1.0, 0.6, 0.1, key="long_wm_opacity")
         st.markdown('##### Sound Effects (SFX) <span class="badge-optional">Optional</span>', unsafe_allow_html=True)
         sfx_files = st.file_uploader("Upload Transition SFX", type=["mp3", "wav"], accept_multiple_files=True, key="long_sfx")
 
@@ -192,19 +193,19 @@ def long_assets_ui() -> Dict[str, Any]:
     intro_path = save_uploaded_file(intro_file, TEMP_DIR)
     outro_path = save_uploaded_file(outro_file, TEMP_DIR)
     
-    st.markdown('##### Subscribe Overlay (Mid-Video) <span class="badge-optional">Optional</span>', unsafe_allow_html=True)
+    st.markdown('##### Subscribe Overlay (Mid-Video, Green Screen Support) <span class="badge-optional">Optional</span>', unsafe_allow_html=True)
     subscribe_overlay_file = st.file_uploader(
-        "Upload Subscribe Overlay (PNG/MP4)",
+        "Upload Subscribe Overlay (PNG with green screen or MP4)",
         type=["png", "jpg", "jpeg", "mp4", "mov", "webm"],
         key="long_subscribe_overlay",
-        help="Upload a transparent PNG or green-screen video. It will appear around the 8-minute mark."
+        help="Upload a green-screen PNG/MP4. Chromakey will automatically remove green background. Appears at 7-8 min mark."
     )
     subscribe_path = save_uploaded_file(subscribe_overlay_file, TEMP_DIR)
 
     return {
         "voice": voice_path, "clips": clips_paths, "b_rolls": broll_paths, "music": music_path,
         "watermark": watermark_path, "sfx": sfx_paths, "intro": intro_path, "outro": outro_path,
-        "subscribe": subscribe_path,
+        "subscribe": subscribe_path, "wm_opacity": wm_opacity,
     }
 
 # ================================================================
@@ -350,7 +351,7 @@ def execute_rendering_pipeline(
                 output_path=str(output_file),
                 custom_logo_path=assets.get("watermark"),
                 subscribe_overlay=assets.get("subscribe"),
-                wm_opacity=0.6,
+                wm_opacity=assets.get("wm_opacity", 0.6),
                 niche=merged_settings.get("niche", "default"),
                 caption_mode=caption_mode,
                 style_id=style_id,
