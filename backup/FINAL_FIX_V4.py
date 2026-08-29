@@ -1,0 +1,306 @@
+  
+"""FINAL FIX V4 — Complete Reels Upload Studio UI with ALL editing settings visible"""
+from pathlib import Path
+import shutil, time, re
+
+APP = Path(r"D:\My Creation Video Generator\backup\app.py")
+ts = int(time.time())
+shutil.copy2(APP, APP.parent / f"app.py.bak_finalv4_{ts}")
+text = APP.read_text(encoding="utf-8")
+print("=" * 60)
+print("FINAL FIX V4 — Full UI with Editing Settings")
+print("=" * 60)
+
+# STEP 1: Fix trim default
+text = text.replace('("rus_trim_e",60.0)', '("rus_trim_e",0.0)')
+print("[1] Trim fixed")
+
+# STEP 2: Remove zoompan
+text = text.replace(
+    '''if mz: vf.append("zoompan=z='min(zoom+0.0015,1.5)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'")''',
+    '# zoompan REMOVED'
+)
+print("[2] Zoompan removed")
+
+# STEP 3: Safe scale
+text = text.replace(
+    'vf.append(f"scale=-2:{th_out}")',
+    'vf.append(f"scale={tw or -2}:{th_out or -2}:force_original_aspect_ratio=decrease,pad={tw}:{th_out}:(ow-iw)/2:(oh-ih)/2")'
+)
+print("[3] Scale fixed")
+
+# STEP 4: Find the function start and end
+lines = text.split('\n')
+func_start = None
+func_end = None
+
+for i, line in enumerate(lines):
+    if 'def reels_upload_studio_tab' in line:
+        func_start = i
+        # Find next function or end of file
+        indent = len(line) - len(line.lstrip())
+        for j in range(i + 1, len(lines)):
+            l2 = lines[j]
+            if l2.strip() and not l2.strip().startswith('#'):
+                cur_indent = len(l2) - len(l2.lstrip())
+                if cur_indent <= indent and ('def ' in l2 or '@st.' in l2):
+                    func_end = j
+                    break
+        if func_end is None:
+            func_end = len(lines)
+        break
+
+if func_start:
+    print(f"[4] Found function: lines {func_start+1} → {func_end}")
+else:
+    print("[4] ❌ Function not found")
+    exit()
+
+# STEP 5: Build the NEW function body after the def line
+# The def line stays, we rebuild everything after it
+
+NEW_FUNCTION_BODY = '''
+    """Reels Upload Studio — Complete AI Video Editor"""
+    # ───── PAGE CONFIG ─────
+    st.markdown("""<style>
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
+    .stTabs [data-baseweb="tab"] { border-radius: 8px 8px 0 0; padding: 8px 16px; }
+    .stButton>button { border-radius: 10px; font-weight: 600; transition: 0.2s; }
+    .stButton>button:hover { transform: scale(1.02); }
+    .stExpander { border: 1px solid #e0e0e0; border-radius: 12px; margin-bottom: 6px; }
+    .stMetric { background: linear-gradient(135deg,#667eea,#764ba2); padding: 10px; border-radius: 10px; color: #fff; }
+    </style>""", unsafe_allow_html=True)
+    
+    st.header("🎬 Reels Upload Studio")
+    st.caption("Professional AI Video Editor — Edit, Transform, Publish")
+    
+    if "rus_queue" not in st.session_state:
+        st.session_state.rus_queue = []
+    
+    # ═══════════════════════════════════════
+    # ROW 1: Type + Aspect Ratio
+    # ═══════════════════════════════════════
+    r1, r2, r3 = st.columns([1, 1, 2])
+    with r1:
+        vid_type = st.radio("📹 Video Type", ["Short (Reels/Shorts)", "Long Video"], horizontal=True, key="rus_vidtype")
+    with r2:
+        ar_choice = st.selectbox("📐 Aspect Ratio", ["9:16 (TikTok)", "16:9 (YouTube)", "1:1 (Instagram)", "4:5", "Original"], key="rus_ar")
+        ar_map_val = {"9:16 (TikTok)": (1080, 1920), "16:9 (YouTube)": (1920, 1080), "1:1 (Instagram)": (1080, 1080), "4:5": (1080, 1350), "Original": (None, None)}
+        tw, th_ = ar_map_val.get(ar_choice, (None, None))
+    with r3:
+        nic = st.selectbox("🎯 Niche", ["auto", "interior_design", "home_design", "food", "travel", "fitness", "fashion", "tech", "gaming", "music", "nature", "sports", "education", "cooking"], key="rus_niche")
+
+    # ═══════════════════════════════════════
+    # ROW 2: Preset + Caption Style
+    # ═══════════════════════════════════════
+    p1, p2 = st.columns(2)
+    with p1:
+        preset_name = st.selectbox("🎨 Preset", list(PRESETS.keys()), key="rus_preset")
+        preset = PRESETS.get(preset_name, PRESETS.get("Cinematic", {}))
+    with p2:
+        cap_style = st.selectbox("💬 Caption Style", ["kinetic", "classic", "neon", "minimal", "bold", "typewriter"], key="rus_capstyle")
+
+    # ═══════════════════════════════════════
+    # VIDEO UPLOAD
+    # ═══════════════════════════════════════
+    st.divider()
+    uf = st.file_uploader("📤 Upload Video", type=["mp4", "mov", "avi", "mkv", "webm", "mpeg4"], key="rus_upload", help="Max 200MB")
+    
+    has_vid = uf is not None
+    
+    if has_vid:
+        import tempfile, os as _os
+        tdir = tempfile.gettempdir()
+        inpath = Path(tdir) / f"rus_{int(time.time())}_{uf.name}"
+        inpath.write_bytes(uf.read())
+        vs = str(inpath)
+        
+        # ───── VIDEO INFO ─────
+        import subprocess, json as _json
+        try:
+            probe = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", vs],
+                                   capture_output=True, text=True, timeout=15)
+            info = _json.loads(probe.stdout) if probe.returncode == 0 else {}
+            dur = float(info.get("format", {}).get("duration", 0))
+            v_stream = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), {})
+            vw = v_stream.get("width", 0)
+            vh = v_stream.get("height", 0)
+        except:
+            dur, vw, vh = 0, 0, 0
+        
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("⏱ Duration", f"{dur:.1f}s")
+        i2.metric("📐 Resolution", f"{vw}x{vh}" if vw else "?")
+        i3.metric("📦 Size", f"{inpath.stat().st_size / 1024 / 1024:.1f} MB")
+        i4.metric("🎞 FPS", f"{eval(v_stream.get('r_frame_rate', '0/1')):.0f}" if v_stream.get('r_frame_rate') else "?")
+        
+        # ═══════════════════════════════════════
+        # TRIM
+        # ═══════════════════════════════════════
+        with st.expander("✂️ Trim / Split", expanded=False):
+            ts_, te_ = st.columns(2)
+            with ts_:
+                trim_s = st.number_input("Start (sec)", 0.0, float(dur) if dur > 0 else 999.0, 0.0, 0.1, key="rus_trim_s")
+            with te_:
+                trim_e = st.number_input("End (sec)", 0.0, float(dur) if dur > 0 else 999.0, 0.0, 0.1, key="rus_trim_e")
+        
+        # ═══════════════════════════════════════
+        # ⭐ ALL EDITING SETTINGS — 4 TABS
+        # ═══════════════════════════════════════
+        st.divider()
+        st.subheader("⚙️ Editing Settings")
+        
+        tab1, tab2, tab3, tab4 = st.tabs(["🎬 Video", "🎤 Voice & Audio", "🎨 Color & FX", "🏷 Branding"])
+        
+        with tab1:
+            st.caption("🎬 Video processing — all options are OPTIONAL")
+            vc1, vc2, vc3 = st.columns(3)
+            with vc1:
+                ac = st.checkbox("🌈 Auto Color", True, key="rac_v4")
+                sh = st.checkbox("🔪 Sharpen", True, key="rsh_v4")
+                hdr = st.checkbox("☀️ HDR Look", False, key="rhdr_v4")
+                vnr = st.checkbox("🔇 Noise Reduce", False, key="rvnr_v4")
+                fe = st.checkbox("👤 Face Enhance", False, key="rfe_v4")
+            with vc2:
+                ms = st.checkbox("📹 Stabilize", False, key="rms_v4")
+                mf = st.checkbox("🪞 Mirror Flip", False, key="rmf_v4")
+                mp = st.checkbox("↔️ Pan Motion", True, key="rmp_v4")
+                msh = st.checkbox("📳 Shake", False, key="rmsh_v4")
+                mb = st.checkbox("🌫 Motion Blur", False, key="rmb_v4")
+            with vc3:
+                u1080 = st.checkbox("📺 Upscale 1080p", True, key="ru1080_v4")
+                u4k = st.checkbox("🎯 Upscale 4K", False, key="ru4k_v4")
+                ce = st.checkbox("💬 AI Captions", True, key="rcap_v4")
+            mz = False
+            cpus = st.slider("⚡ CPU Cores", 1, 4, 2, key="rcpu_v4")
+        
+        with tab2:
+            st.caption("🎤 Voice & Audio — all options are OPTIONAL")
+            vv1, vv2, vv3 = st.columns(3)
+            with vv1:
+                vp = st.slider("🎵 Voice Pitch", -12, 12, 0, key="rvp_v4", help="-12=deep, +12=chipmunk")
+                vs_v = st.slider("⏩ Voice Speed", 0.7, 1.5, 1.0, 0.05, key="rvs_v4")
+            with vv2:
+                vv = st.slider("🔊 Voice Volume", 0.5, 2.0, 1.0, 0.1, key="rvv_v4")
+                nr = st.checkbox("🎧 Noise Removal", True, key="rnr_v4")
+            with vv3:
+                bgv = st.slider("🎼 BG Music Vol", 0.0, 1.0, 0.3, 0.05, key="rbgv_v4")
+                sfxv = st.slider("💥 SFX Vol", 0.0, 1.0, 0.7, 0.05, key="rsfxv_v4")
+        
+        with tab3:
+            st.caption("🎨 Color, Transitions & SFX — all optional")
+            cl1, cl2 = st.columns(2)
+            with cl1:
+                sat = st.slider("🌈 Saturation", 0.5, 2.0, 1.1, 0.05, key="rsat_v4")
+                con = st.slider("🌓 Contrast", 0.5, 2.0, 1.05, 0.05, key="rcon_v4")
+            with cl2:
+                tr = st.selectbox("🎬 Transition", [
+                    "fade","dissolve","slide_left","slide_right","slide_up","slide_down",
+                    "flash","glitch","cross_zoom","whip","film_burn","zoom_in","spin",
+                    "morph","smooth_blur","light_leak","dynamic_slide","circle_open",
+                    "page_curl","pixelate","doorway","radial","swirl","cube","fadegrayscale"
+                ], key="rtr_v4")
+        
+        with tab4:
+            st.caption("🏷 Branding & Watermark — all optional")
+            br1, br2, br3 = st.columns(3)
+            with br1:
+                lf = st.file_uploader("🖼 Logo (PNG)", type=["png"], key="rlogo_v4")
+            with br2:
+                inf = st.file_uploader("🎬 Intro Clip", type=["mp4","mov"], key="rintro_v4")
+            with br3:
+                outf = st.file_uploader("🎬 Outro Clip", type=["mp4","mov"], key="routro_v4")
+            br4, br5 = st.columns(2)
+            with br4:
+                wmt = st.text_input("💧 Watermark Text", key="rwmtxt_v4", placeholder="@yourhandle")
+            with br5:
+                wmp = st.selectbox("📍 Position", ["bottom-right","bottom-left","top-right","top-left"], key="rwmpos_v4")
+            ba1, ba2 = st.columns(2)
+            with ba1:
+                bgp = st.file_uploader("🎼 BG Music (MP3/WAV)", type=["mp3","wav","m4a"], key="rbgm_v4")
+            with ba2:
+                sfxp = st.file_uploader("💥 SFX Burst (MP3/WAV)", type=["mp3","wav"], key="rsfx_v4")
+        
+        # ═══════════════════════════════════════
+        # RENDER BUTTON
+        # ═══════════════════════════════════════
+        st.divider()
+        if st.button("🚀 Generate Video", type="primary", use_container_width=True):
+            od = Path.cwd() / "output_reels"
+            od.mkdir(exist_ok=True)
+            
+            # Note: bgp, sfxp, inf, outf, lf — pass paths as strings or None
+            bgp_s = str(Path(tdir) / f"bgm_{int(time.time())}_{bgp.name}") if bgp else None
+            sfxp_s = str(Path(tdir) / f"sfx_{int(time.time())}_{sfxp.name}") if sfxp else None
+            inf_s = str(Path(tdir) / f"intro_{int(time.time())}_{inf.name}") if inf else None
+            outf_s = str(Path(tdir) / f"outro_{int(time.time())}_{outf.name}") if outf else None
+            lf_s = str(Path(tdir) / f"logo_{int(time.time())}_{lf.name}") if lf else None
+            
+            if bgp: Path(bgp_s).write_bytes(bgp.read())
+            if sfxp: Path(sfxp_s).write_bytes(sfxp.read())
+            if inf: Path(inf_s).write_bytes(inf.read())
+            if outf: Path(outf_s).write_bytes(outf.read())
+            if lf: Path(lf_s).write_bytes(lf.read())
+            
+            with st.spinner("🎬 Rendering video..."):
+                op = od / f"output_{int(time.time())}.mp4"
+                try:
+                    ok, err = _render_video(
+                        vs, str(op), cpus, mf, ms, vnr, fe, u4k, u1080,
+                        ac, sat, con, sh, hdr, mz, mp, msh, mb,
+                        preset, wmt, wmp, vs_v, vp, vv, nr, bgv,
+                        tr, tw, th_, bgp_s, sfxp_s, sfxv,
+                        inf_s, outf_s, lf_s,
+                        [], trim_s, trim_e if trim_e > 0 else None
+                    )
+                    if ok:
+                        st.success(f"✅ Done! Saved: {op.name}")
+                        with open(str(op), "rb") as f:
+                            st.download_button("⬇ Download", f, file_name=op.name, mime="video/mp4")
+                    else:
+                        st.error(f"❌ Render failed: {err}")
+                except Exception as ex:
+                    st.error(f"❌ Error: {ex}")
+    
+    else:
+        st.info("👆 Upload a video to start editing")
+    
+    # ───── BATCH QUEUE ─────
+    st.divider()
+    st.subheader("📋 Queue")
+    if st.session_state.rus_queue:
+        for qi, q in enumerate(st.session_state.rus_queue):
+            st.text(f"{qi+1}. {q.get('name','?')} → {q.get('status','pending')}")
+    else:
+        st.caption("No videos in queue — upload a video above")
+'''
+
+# Replace the function body
+new_lines = lines[:func_start + 1] + [NEW_FUNCTION_BODY]
+
+# If there's code after the function, preserve the last line
+if func_end < len(lines):
+    new_lines.append(lines[func_end])
+
+text = '\n'.join(new_lines)
+
+APP.write_text(text, encoding="utf-8")
+print(f"[5] Written: {len(text)} chars")
+
+try:
+    compile(text, "app.py", "exec")
+    print("\n✅✅✅ SYNTAX OK! ✅✅✅")
+    print("\n─── COMPLETE UI WITH ALL SETTINGS ───")
+    print("  🎬 Video tab: Color, Sharpen, HDR, Noise, Face, Stabilize, Mirror, Pan, Shake, Blur, 1080p, 4K, Captions")
+    print("  🎤 Voice tab: Pitch, Speed, Volume, Noise, BG Music Vol, SFX Vol")
+    print("  🎨 Color tab: Saturation, Contrast, 25 Transitions")
+    print("  🏷 Branding tab: Logo, Intro, Outro, Watermark, BG Music, SFX")
+    print("  📤 Upload + ✂️ Trim + 🚀 Render — all connected")
+    print("  🟢 ALL features are OPTIONAL")
+    print("\nRun: streamlit run app.py")
+except SyntaxError as e:
+    print(f"\n❌ Line {e.lineno}: {e.msg}")
+    L = text.split('\n')
+    for ln in range(max(0, e.lineno - 4), min(len(L), e.lineno + 3)):
+        marker = ">>>" if ln + 1 == e.lineno else "   "
+        print(f"  {marker} {ln+1}: {L[ln][:200]}")

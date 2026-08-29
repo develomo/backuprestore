@@ -1,0 +1,818 @@
+2026-07-26 19:14:26,811 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:14:26,812 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:14:26,813 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:14:26,814 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:14:26,815 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:14:26,816 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:14:26,820 [INFO] Auto preset chosen: #8 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:14:26,822 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:14:26,823 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:14:26,827 [INFO] ============================================================
+2026-07-26 19:14:26,828 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,829 [INFO] Content length: 392 chars
+2026-07-26 19:14:26,833 [INFO] Niche override: None
+2026-07-26 19:14:26,833 [INFO] Preset override: None
+2026-07-26 19:14:26,834 [INFO] ============================================================
+2026-07-26 19:14:26,835 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:14:26,835 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:14:26,837 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,838 [INFO] ============================================================
+2026-07-26 19:14:26,839 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,839 [INFO] Content length: 312 chars
+2026-07-26 19:14:26,840 [INFO] Niche override: None
+2026-07-26 19:14:26,840 [INFO] Preset override: None
+2026-07-26 19:14:26,841 [INFO] ============================================================
+2026-07-26 19:14:26,842 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:14:26,842 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:14:26,843 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,844 [INFO] ============================================================
+2026-07-26 19:14:26,845 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,845 [INFO] Content length: 308 chars
+2026-07-26 19:14:26,846 [INFO] Niche override: None
+2026-07-26 19:14:26,847 [INFO] Preset override: None
+2026-07-26 19:14:26,850 [INFO] ============================================================
+2026-07-26 19:14:26,851 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:14:26,851 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:14:26,852 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,854 [INFO] ============================================================
+2026-07-26 19:14:26,854 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,855 [INFO] Content length: 343 chars
+2026-07-26 19:14:26,855 [INFO] Niche override: None
+2026-07-26 19:14:26,856 [INFO] Preset override: None
+2026-07-26 19:14:26,857 [INFO] ============================================================
+2026-07-26 19:14:26,857 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:14:26,858 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:14:26,859 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,860 [INFO] ============================================================
+2026-07-26 19:14:26,860 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,861 [INFO] Content length: 36 chars
+2026-07-26 19:14:26,862 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:14:26,862 [INFO] Preset override: 4
+2026-07-26 19:14:26,863 [INFO] ============================================================
+2026-07-26 19:14:26,866 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,867 [INFO] ============================================================
+2026-07-26 19:14:26,868 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,869 [INFO] Content length: 22 chars
+2026-07-26 19:14:26,869 [INFO] Niche override: default
+2026-07-26 19:14:26,870 [INFO] Preset override: 1
+2026-07-26 19:14:26,870 [INFO] ============================================================
+2026-07-26 19:14:26,872 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,873 [INFO] ============================================================
+2026-07-26 19:14:26,873 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,874 [INFO] Content length: 0 chars
+2026-07-26 19:14:26,874 [INFO] Niche override: default
+2026-07-26 19:14:26,875 [INFO] Preset override: 1
+2026-07-26 19:14:26,876 [INFO] ============================================================
+2026-07-26 19:14:26,876 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:14:26,877 [INFO] ============================================================
+2026-07-26 19:14:26,878 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:14:26,879 [INFO] Content length: 5000 chars
+2026-07-26 19:14:26,879 [INFO] Niche override: None
+2026-07-26 19:14:26,883 [INFO] Preset override: None
+2026-07-26 19:14:26,883 [INFO] ============================================================
+2026-07-26 19:14:26,919 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:14:26,920 [ERROR] get_preset_with_variation failed: name 'get_preset_with_variation' is not defined
+2026-07-26 19:23:13,584 [INFO] Fallback detection: luxury_lifestyle (score=12)
+2026-07-26 19:23:13,585 [INFO] Fallback detection: quantum_future (score=16)
+2026-07-26 19:23:13,587 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:23:13,588 [INFO] Fallback detection: stoic_wisdom (score=12)
+2026-07-26 19:23:13,589 [INFO] Fallback detection: interior_design (score=12)
+2026-07-26 19:23:13,591 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:23:13,595 [INFO] No keywords matched, using default niche
+2026-07-26 19:23:13,599 [INFO] ============================================================
+2026-07-26 19:23:13,600 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:13,600 [INFO] Content length: 52 chars
+2026-07-26 19:23:13,601 [INFO] Niche override: None
+2026-07-26 19:23:13,602 [INFO] Preset override: None
+2026-07-26 19:23:13,603 [INFO] ============================================================
+2026-07-26 19:23:13,611 [INFO] Brain detected: niche=luxury_lifestyle, confidence=1.00
+2026-07-26 19:23:13,612 [INFO] Generating configs for ~11 clips (avg duration: 5.4s)
+2026-07-26 19:23:13,613 [INFO] Config generated: 11 clips, niche=luxury_lifestyle, preset=#2, render=#8
+2026-07-26 19:23:26,280 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:23:26,281 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:23:26,285 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:23:26,285 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:23:26,286 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:23:26,287 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:23:26,290 [INFO] Auto preset chosen: #8 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:23:26,292 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:23:26,293 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:23:26,295 [INFO] ============================================================
+2026-07-26 19:23:26,296 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,296 [INFO] Content length: 392 chars
+2026-07-26 19:23:26,297 [INFO] Niche override: None
+2026-07-26 19:23:26,298 [INFO] Preset override: None
+2026-07-26 19:23:26,299 [INFO] ============================================================
+2026-07-26 19:23:26,316 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:23:26,316 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:23:26,319 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:23:26,320 [INFO] Generating configs for ~12 clips (avg duration: 4.9s)
+2026-07-26 19:23:26,323 [INFO] Config generated: 12 clips, niche=luxury_lifestyle, preset=#5, render=#9
+2026-07-26 19:23:26,327 [INFO] ============================================================
+2026-07-26 19:23:26,327 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,328 [INFO] Content length: 312 chars
+2026-07-26 19:23:26,329 [INFO] Niche override: None
+2026-07-26 19:23:26,330 [INFO] Preset override: None
+2026-07-26 19:23:26,331 [INFO] ============================================================
+2026-07-26 19:23:26,334 [INFO] Brain detected: niche=quantum_future, confidence=1.00
+2026-07-26 19:23:26,336 [INFO] Generating configs for ~15 clips (avg duration: 3.9s)
+2026-07-26 19:23:26,338 [INFO] Config generated: 15 clips, niche=quantum_future, preset=#1, render=#10
+2026-07-26 19:23:26,341 [INFO] ============================================================
+2026-07-26 19:23:26,342 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,342 [INFO] Content length: 308 chars
+2026-07-26 19:23:26,343 [INFO] Niche override: None
+2026-07-26 19:23:26,344 [INFO] Preset override: None
+2026-07-26 19:23:26,345 [INFO] ============================================================
+2026-07-26 19:23:26,347 [INFO] Brain detected: niche=mystery, confidence=1.00
+2026-07-26 19:23:26,348 [INFO] Generating configs for ~7 clips (avg duration: 7.8s)
+2026-07-26 19:23:26,349 [INFO] Config generated: 7 clips, niche=mystery, preset=#6, render=#11
+2026-07-26 19:23:26,355 [INFO] ============================================================
+2026-07-26 19:23:26,356 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,357 [INFO] Content length: 343 chars
+2026-07-26 19:23:26,357 [INFO] Niche override: None
+2026-07-26 19:23:26,358 [INFO] Preset override: None
+2026-07-26 19:23:26,358 [INFO] ============================================================
+2026-07-26 19:23:26,360 [INFO] Brain detected: niche=stoic_wisdom, confidence=1.00
+2026-07-26 19:23:26,362 [INFO] Generating configs for ~9 clips (avg duration: 6.5s)
+2026-07-26 19:23:26,362 [INFO] Config generated: 9 clips, niche=stoic_wisdom, preset=#1, render=#12
+2026-07-26 19:23:26,365 [INFO] ============================================================
+2026-07-26 19:23:26,366 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,367 [INFO] Content length: 36 chars
+2026-07-26 19:23:26,370 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:23:26,371 [INFO] Preset override: 4
+2026-07-26 19:23:26,371 [INFO] ============================================================
+2026-07-26 19:23:26,372 [INFO] Generating configs for ~10 clips (avg duration: 4.1s)
+2026-07-26 19:23:26,374 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#4, render=#13
+2026-07-26 19:23:26,376 [INFO] ============================================================
+2026-07-26 19:23:26,376 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,377 [INFO] Content length: 22 chars
+2026-07-26 19:23:26,378 [INFO] Niche override: default
+2026-07-26 19:23:26,378 [INFO] Preset override: 1
+2026-07-26 19:23:26,379 [INFO] ============================================================
+2026-07-26 19:23:26,380 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:23:26,381 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#14
+2026-07-26 19:23:26,382 [INFO] ============================================================
+2026-07-26 19:23:26,382 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,383 [INFO] Content length: 22 chars
+2026-07-26 19:23:26,386 [INFO] Niche override: default
+2026-07-26 19:23:26,387 [INFO] Preset override: 1
+2026-07-26 19:23:26,388 [INFO] ============================================================
+2026-07-26 19:23:26,389 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:23:26,390 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#15
+2026-07-26 19:23:26,391 [INFO] ============================================================
+2026-07-26 19:23:26,392 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,393 [INFO] Content length: 0 chars
+2026-07-26 19:23:26,393 [INFO] Niche override: default
+2026-07-26 19:23:26,394 [INFO] Preset override: 1
+2026-07-26 19:23:26,395 [INFO] ============================================================
+2026-07-26 19:23:26,396 [INFO] Generating configs for ~3 clips (avg duration: 5.5s)
+2026-07-26 19:23:26,396 [INFO] Config generated: 3 clips, niche=default, preset=#1, render=#16
+2026-07-26 19:23:26,397 [INFO] ============================================================
+2026-07-26 19:23:26,398 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:23:26,399 [INFO] Content length: 5000 chars
+2026-07-26 19:23:26,399 [INFO] Niche override: None
+2026-07-26 19:23:26,403 [INFO] Preset override: None
+2026-07-26 19:23:26,403 [INFO] ============================================================
+2026-07-26 19:23:26,406 [INFO] Brain detected: niche=default, confidence=0.30
+2026-07-26 19:23:26,407 [INFO] Generating configs for ~60 clips (avg duration: 3.5s)
+2026-07-26 19:23:26,410 [INFO] Config generated: 60 clips, niche=default, preset=#2, render=#17
+2026-07-26 19:31:28,547 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:31:28,548 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:31:28,550 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:31:28,551 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:31:28,552 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:31:28,552 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:31:28,555 [INFO] Auto preset chosen: #8 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:31:28,556 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,557 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:31:28,558 [INFO] ============================================================
+2026-07-26 19:31:28,559 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,560 [INFO] Content length: 392 chars
+2026-07-26 19:31:28,563 [INFO] Niche override: None
+2026-07-26 19:31:28,564 [INFO] Preset override: None
+2026-07-26 19:31:28,565 [INFO] ============================================================
+2026-07-26 19:31:28,566 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:31:28,567 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:31:28,567 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,568 [INFO] Generating configs for ~8 clips (avg duration: 6.8s)
+2026-07-26 19:31:28,570 [INFO] Config generated: 8 clips, niche=luxury_lifestyle, preset=#6, render=#18
+2026-07-26 19:31:28,572 [INFO] ============================================================
+2026-07-26 19:31:28,573 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,574 [INFO] Content length: 312 chars
+2026-07-26 19:31:28,574 [INFO] Niche override: None
+2026-07-26 19:31:28,575 [INFO] Preset override: None
+2026-07-26 19:31:28,575 [INFO] ============================================================
+2026-07-26 19:31:28,577 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:31:28,577 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:31:28,578 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,582 [INFO] Generating configs for ~17 clips (avg duration: 3.5s)
+2026-07-26 19:31:28,583 [INFO] Config generated: 17 clips, niche=quantum_future, preset=#3, render=#19
+2026-07-26 19:31:28,586 [INFO] ============================================================
+2026-07-26 19:31:28,586 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,587 [INFO] Content length: 308 chars
+2026-07-26 19:31:28,587 [INFO] Niche override: None
+2026-07-26 19:31:28,588 [INFO] Preset override: None
+2026-07-26 19:31:28,589 [INFO] ============================================================
+2026-07-26 19:31:28,590 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:31:28,590 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:31:28,591 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,592 [INFO] Generating configs for ~7 clips (avg duration: 7.8s)
+2026-07-26 19:31:28,593 [INFO] Config generated: 7 clips, niche=mystery, preset=#6, render=#20
+2026-07-26 19:31:28,599 [INFO] ============================================================
+2026-07-26 19:31:28,600 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,601 [INFO] Content length: 343 chars
+2026-07-26 19:31:28,601 [INFO] Niche override: None
+2026-07-26 19:31:28,602 [INFO] Preset override: None
+2026-07-26 19:31:28,603 [INFO] ============================================================
+2026-07-26 19:31:28,605 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:31:28,605 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:31:28,606 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:31:28,607 [INFO] Generating configs for ~10 clips (avg duration: 6.0s)
+2026-07-26 19:31:28,608 [INFO] Config generated: 10 clips, niche=stoic_wisdom, preset=#2, render=#21
+2026-07-26 19:31:28,613 [INFO] ============================================================
+2026-07-26 19:31:28,614 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,615 [INFO] Content length: 36 chars
+2026-07-26 19:31:28,616 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:31:28,617 [INFO] Preset override: 4
+2026-07-26 19:31:28,617 [INFO] ============================================================
+2026-07-26 19:31:28,619 [INFO] Generating configs for ~10 clips (avg duration: 4.1s)
+2026-07-26 19:31:28,620 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#4, render=#22
+2026-07-26 19:31:28,621 [INFO] ============================================================
+2026-07-26 19:31:28,622 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,623 [INFO] Content length: 14 chars
+2026-07-26 19:31:28,624 [INFO] Niche override: default
+2026-07-26 19:31:28,624 [INFO] Preset override: 1
+2026-07-26 19:31:28,625 [INFO] ============================================================
+2026-07-26 19:31:28,626 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:31:28,630 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#23
+2026-07-26 19:31:28,631 [INFO] ============================================================
+2026-07-26 19:31:28,632 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,632 [INFO] Content length: 14 chars
+2026-07-26 19:31:28,633 [INFO] Niche override: default
+2026-07-26 19:31:28,634 [INFO] Preset override: 1
+2026-07-26 19:31:28,634 [INFO] ============================================================
+2026-07-26 19:31:28,636 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:31:28,637 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#24
+2026-07-26 19:31:28,638 [INFO] ============================================================
+2026-07-26 19:31:28,638 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,639 [INFO] Content length: 0 chars
+2026-07-26 19:31:28,640 [INFO] Niche override: default
+2026-07-26 19:31:28,640 [INFO] Preset override: 1
+2026-07-26 19:31:28,641 [INFO] ============================================================
+2026-07-26 19:31:28,642 [INFO] Generating configs for ~3 clips (avg duration: 5.5s)
+2026-07-26 19:31:28,643 [INFO] Config generated: 3 clips, niche=default, preset=#1, render=#25
+2026-07-26 19:31:28,645 [INFO] ============================================================
+2026-07-26 19:31:28,647 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,648 [INFO] Content length: 5000 chars
+2026-07-26 19:31:28,649 [INFO] Niche override: None
+2026-07-26 19:31:28,649 [INFO] Preset override: None
+2026-07-26 19:31:28,650 [INFO] ============================================================
+2026-07-26 19:31:28,651 [WARNING] Brain failed: 7, falling back to keyword match
+2026-07-26 19:31:28,652 [INFO] No keywords matched, using default niche
+2026-07-26 19:31:28,652 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:31:28,654 [INFO] Generating configs for ~60 clips (avg duration: 3.5s)
+2026-07-26 19:31:28,656 [INFO] Config generated: 60 clips, niche=default, preset=#2, render=#26
+2026-07-26 19:31:28,666 [INFO] ============================================================
+2026-07-26 19:31:28,666 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,667 [INFO] Content length: 392 chars
+2026-07-26 19:31:28,667 [INFO] Niche override: None
+2026-07-26 19:31:28,668 [INFO] Preset override: None
+2026-07-26 19:31:28,668 [INFO] ============================================================
+2026-07-26 19:31:28,669 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:31:28,670 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:31:28,670 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,671 [INFO] Generating configs for ~11 clips (avg duration: 5.4s)
+2026-07-26 19:31:28,672 [INFO] Config generated: 11 clips, niche=luxury_lifestyle, preset=#2, render=#27
+2026-07-26 19:31:28,673 [INFO] ============================================================
+2026-07-26 19:31:28,673 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,674 [INFO] Content length: 312 chars
+2026-07-26 19:31:28,674 [INFO] Niche override: None
+2026-07-26 19:31:28,675 [INFO] Preset override: None
+2026-07-26 19:31:28,675 [INFO] ============================================================
+2026-07-26 19:31:28,676 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:31:28,677 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:31:28,677 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,679 [INFO] Generating configs for ~16 clips (avg duration: 3.6s)
+2026-07-26 19:31:28,682 [INFO] Config generated: 16 clips, niche=quantum_future, preset=#6, render=#28
+2026-07-26 19:31:28,683 [INFO] ============================================================
+2026-07-26 19:31:28,684 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,685 [INFO] Content length: 308 chars
+2026-07-26 19:31:28,686 [INFO] Niche override: None
+2026-07-26 19:31:28,686 [INFO] Preset override: None
+2026-07-26 19:31:28,687 [INFO] ============================================================
+2026-07-26 19:31:28,688 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:31:28,689 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:31:28,689 [INFO] Auto preset chosen: #7 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:31:28,690 [INFO] Generating configs for ~12 clips (avg duration: 4.8s)
+2026-07-26 19:31:28,691 [INFO] Config generated: 12 clips, niche=mystery, preset=#7, render=#29
+2026-07-26 19:31:28,692 [INFO] ============================================================
+2026-07-26 19:31:28,693 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,696 [INFO] Content length: 343 chars
+2026-07-26 19:31:28,697 [INFO] Niche override: None
+2026-07-26 19:31:28,698 [INFO] Preset override: None
+2026-07-26 19:31:28,698 [INFO] ============================================================
+2026-07-26 19:31:28,700 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:31:28,700 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:31:28,701 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:31:28,702 [INFO] Generating configs for ~10 clips (avg duration: 6.0s)
+2026-07-26 19:31:28,702 [INFO] Config generated: 10 clips, niche=stoic_wisdom, preset=#2, render=#30
+2026-07-26 19:31:28,703 [INFO] ============================================================
+2026-07-26 19:31:28,704 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,705 [INFO] Content length: 313 chars
+2026-07-26 19:31:28,706 [INFO] Niche override: None
+2026-07-26 19:31:28,706 [INFO] Preset override: None
+2026-07-26 19:31:28,707 [INFO] ============================================================
+2026-07-26 19:31:28,709 [INFO] Brain detected: niche=interior_design, confidence=1.00
+2026-07-26 19:31:28,711 [INFO] Generating configs for ~12 clips (avg duration: 5.0s)
+2026-07-26 19:31:28,714 [INFO] Config generated: 12 clips, niche=interior_design, preset=#2, render=#31
+2026-07-26 19:31:28,715 [INFO] ============================================================
+2026-07-26 19:31:28,715 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:31:28,716 [INFO] Content length: 315 chars
+2026-07-26 19:31:28,717 [INFO] Niche override: None
+2026-07-26 19:31:28,717 [INFO] Preset override: None
+2026-07-26 19:31:28,718 [INFO] ============================================================
+2026-07-26 19:31:28,720 [INFO] Brain detected: niche=finance_simulation, confidence=1.00
+2026-07-26 19:31:28,722 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:31:28,722 [INFO] Config generated: 10 clips, niche=finance_simulation, preset=#5, render=#32
+2026-07-26 19:38:21,648 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:38:21,648 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:38:21,648 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:38:21,648 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:38:21,648 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:38:21,648 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:38:21,648 [INFO] Auto preset chosen: #3 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:38:21,648 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,648 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:38:21,664 [INFO] ============================================================
+2026-07-26 19:38:21,664 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,664 [INFO] Content length: 392 chars
+2026-07-26 19:38:21,664 [INFO] Niche override: None
+2026-07-26 19:38:21,664 [INFO] Preset override: None
+2026-07-26 19:38:21,664 [INFO] ============================================================
+2026-07-26 19:38:21,664 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:38:21,664 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:38:21,664 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,664 [INFO] Generating configs for ~9 clips (avg duration: 6.2s)
+2026-07-26 19:38:21,672 [INFO] Config generated: 9 clips, niche=luxury_lifestyle, preset=#3, render=#33
+2026-07-26 19:38:21,674 [INFO] ============================================================
+2026-07-26 19:38:21,674 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,674 [INFO] Content length: 312 chars
+2026-07-26 19:38:21,674 [INFO] Niche override: None
+2026-07-26 19:38:21,674 [INFO] Preset override: None
+2026-07-26 19:38:21,674 [INFO] ============================================================
+2026-07-26 19:38:21,674 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:38:21,674 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:38:21,674 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,674 [INFO] Generating configs for ~13 clips (avg duration: 4.5s)
+2026-07-26 19:38:21,674 [INFO] Config generated: 13 clips, niche=quantum_future, preset=#5, render=#34
+2026-07-26 19:38:21,674 [INFO] ============================================================
+2026-07-26 19:38:21,674 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,674 [INFO] Content length: 308 chars
+2026-07-26 19:38:21,674 [INFO] Niche override: None
+2026-07-26 19:38:21,674 [INFO] Preset override: None
+2026-07-26 19:38:21,674 [INFO] ============================================================
+2026-07-26 19:38:21,674 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:38:21,689 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:38:21,689 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,689 [INFO] Generating configs for ~17 clips (avg duration: 3.5s)
+2026-07-26 19:38:21,689 [INFO] Config generated: 17 clips, niche=mystery, preset=#3, render=#35
+2026-07-26 19:38:21,689 [INFO] ============================================================
+2026-07-26 19:38:21,689 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,689 [INFO] Content length: 343 chars
+2026-07-26 19:38:21,689 [INFO] Niche override: None
+2026-07-26 19:38:21,689 [INFO] Preset override: None
+2026-07-26 19:38:21,689 [INFO] ============================================================
+2026-07-26 19:38:21,689 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:38:21,689 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:38:21,689 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:38:21,689 [INFO] Generating configs for ~10 clips (avg duration: 6.0s)
+2026-07-26 19:38:21,704 [INFO] Config generated: 10 clips, niche=stoic_wisdom, preset=#2, render=#36
+2026-07-26 19:38:21,704 [INFO] ============================================================
+2026-07-26 19:38:21,704 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,704 [INFO] Content length: 36 chars
+2026-07-26 19:38:21,704 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:38:21,704 [INFO] Preset override: 4
+2026-07-26 19:38:21,704 [INFO] ============================================================
+2026-07-26 19:38:21,711 [INFO] Generating configs for ~10 clips (avg duration: 4.1s)
+2026-07-26 19:38:21,712 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#4, render=#37
+2026-07-26 19:38:21,712 [INFO] ============================================================
+2026-07-26 19:38:21,712 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,712 [INFO] Content length: 14 chars
+2026-07-26 19:38:21,712 [INFO] Niche override: default
+2026-07-26 19:38:21,712 [INFO] Preset override: 1
+2026-07-26 19:38:21,712 [INFO] ============================================================
+2026-07-26 19:38:21,712 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:38:21,712 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#38
+2026-07-26 19:38:21,712 [INFO] ============================================================
+2026-07-26 19:38:21,712 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,712 [INFO] Content length: 14 chars
+2026-07-26 19:38:21,712 [INFO] Niche override: default
+2026-07-26 19:38:21,712 [INFO] Preset override: 1
+2026-07-26 19:38:21,712 [INFO] ============================================================
+2026-07-26 19:38:21,728 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:38:21,731 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#39
+2026-07-26 19:38:21,731 [INFO] ============================================================
+2026-07-26 19:38:21,731 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,731 [INFO] Content length: 0 chars
+2026-07-26 19:38:21,731 [INFO] Niche override: default
+2026-07-26 19:38:21,731 [INFO] Preset override: 1
+2026-07-26 19:38:21,731 [INFO] ============================================================
+2026-07-26 19:38:21,738 [INFO] Generating configs for ~3 clips (avg duration: 5.5s)
+2026-07-26 19:38:21,739 [INFO] Config generated: 3 clips, niche=default, preset=#1, render=#40
+2026-07-26 19:38:21,739 [INFO] ============================================================
+2026-07-26 19:38:21,739 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,739 [INFO] Content length: 5000 chars
+2026-07-26 19:38:21,739 [INFO] Niche override: None
+2026-07-26 19:38:21,739 [INFO] Preset override: None
+2026-07-26 19:38:21,739 [INFO] ============================================================
+2026-07-26 19:38:21,739 [WARNING] Brain failed: 7, falling back to keyword match
+2026-07-26 19:38:21,739 [INFO] No keywords matched, using default niche
+2026-07-26 19:38:21,739 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:38:21,739 [INFO] Generating configs for ~60 clips (avg duration: 3.5s)
+2026-07-26 19:38:21,748 [INFO] Config generated: 60 clips, niche=default, preset=#2, render=#41
+2026-07-26 19:38:21,748 [INFO] ============================================================
+2026-07-26 19:38:21,748 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,748 [INFO] Content length: 392 chars
+2026-07-26 19:38:21,748 [INFO] Niche override: None
+2026-07-26 19:38:21,748 [INFO] Preset override: None
+2026-07-26 19:38:21,748 [INFO] ============================================================
+2026-07-26 19:38:21,748 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:38:21,764 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:38:21,764 [INFO] Auto preset chosen: #7 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,764 [INFO] Generating configs for ~15 clips (avg duration: 3.9s)
+2026-07-26 19:38:21,768 [INFO] Config generated: 15 clips, niche=luxury_lifestyle, preset=#7, render=#42
+2026-07-26 19:38:21,768 [INFO] ============================================================
+2026-07-26 19:38:21,768 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,768 [INFO] Content length: 312 chars
+2026-07-26 19:38:21,768 [INFO] Niche override: None
+2026-07-26 19:38:21,768 [INFO] Preset override: None
+2026-07-26 19:38:21,768 [INFO] ============================================================
+2026-07-26 19:38:21,768 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:38:21,768 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:38:21,768 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,768 [INFO] Generating configs for ~11 clips (avg duration: 5.2s)
+2026-07-26 19:38:21,768 [INFO] Config generated: 11 clips, niche=quantum_future, preset=#2, render=#43
+2026-07-26 19:38:21,768 [INFO] ============================================================
+2026-07-26 19:38:21,768 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,768 [INFO] Content length: 308 chars
+2026-07-26 19:38:21,768 [INFO] Niche override: None
+2026-07-26 19:38:21,768 [INFO] Preset override: None
+2026-07-26 19:38:21,768 [INFO] ============================================================
+2026-07-26 19:38:21,768 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:38:21,768 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:38:21,784 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,784 [INFO] Generating configs for ~8 clips (avg duration: 7.0s)
+2026-07-26 19:38:21,784 [INFO] Config generated: 8 clips, niche=mystery, preset=#1, render=#44
+2026-07-26 19:38:21,784 [INFO] ============================================================
+2026-07-26 19:38:21,784 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,784 [INFO] Content length: 343 chars
+2026-07-26 19:38:21,784 [INFO] Niche override: None
+2026-07-26 19:38:21,784 [INFO] Preset override: None
+2026-07-26 19:38:21,784 [INFO] ============================================================
+2026-07-26 19:38:21,784 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:38:21,784 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:38:21,784 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:38:21,784 [INFO] Generating configs for ~9 clips (avg duration: 6.5s)
+2026-07-26 19:38:21,784 [INFO] Config generated: 9 clips, niche=stoic_wisdom, preset=#1, render=#45
+2026-07-26 19:38:21,784 [INFO] ============================================================
+2026-07-26 19:38:21,784 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,800 [INFO] Content length: 313 chars
+2026-07-26 19:38:21,800 [INFO] Niche override: None
+2026-07-26 19:38:21,800 [INFO] Preset override: None
+2026-07-26 19:38:21,800 [INFO] ============================================================
+2026-07-26 19:38:21,800 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:38:21,800 [INFO] Fallback detection: interior_design (score=22)
+2026-07-26 19:38:21,800 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:38:21,800 [INFO] Generating configs for ~10 clips (avg duration: 6.0s)
+2026-07-26 19:38:21,800 [INFO] Config generated: 10 clips, niche=interior_design, preset=#6, render=#46
+2026-07-26 19:38:21,800 [INFO] ============================================================
+2026-07-26 19:38:21,800 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:38:21,800 [INFO] Content length: 315 chars
+2026-07-26 19:38:21,800 [INFO] Niche override: None
+2026-07-26 19:38:21,800 [INFO] Preset override: None
+2026-07-26 19:38:21,800 [INFO] ============================================================
+2026-07-26 19:38:21,800 [WARNING] Brain failed: 8, falling back to keyword match
+2026-07-26 19:38:21,800 [INFO] Fallback detection: finance_simulation (score=32)
+2026-07-26 19:38:21,800 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:38:21,816 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:38:21,817 [INFO] Config generated: 10 clips, niche=finance_simulation, preset=#5, render=#47
+2026-07-26 19:46:31,643 [INFO] Fallback detection: luxury_lifestyle (score=12)
+2026-07-26 19:46:31,643 [INFO] Fallback detection: quantum_future (score=16)
+2026-07-26 19:46:31,643 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:46:31,643 [INFO] Fallback detection: stoic_wisdom (score=12)
+2026-07-26 19:46:31,658 [INFO] Fallback detection: interior_design (score=12)
+2026-07-26 19:46:31,658 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:46:31,658 [INFO] No keywords matched, using default niche
+2026-07-26 19:46:31,658 [INFO] ============================================================
+2026-07-26 19:46:31,658 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:31,658 [INFO] Content length: 52 chars
+2026-07-26 19:46:31,658 [INFO] Niche override: None
+2026-07-26 19:46:31,658 [INFO] Preset override: None
+2026-07-26 19:46:31,658 [INFO] ============================================================
+2026-07-26 19:46:31,658 [WARNING] Brain failed: 7, falling back to keyword match
+2026-07-26 19:46:31,658 [INFO] Fallback detection: luxury_lifestyle (score=10)
+2026-07-26 19:46:31,674 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:31,674 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:46:31,678 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#1, render=#48
+2026-07-26 19:46:57,351 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:46:57,351 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:46:57,351 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:46:57,351 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:46:57,351 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:46:57,351 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:46:57,351 [INFO] Auto preset chosen: #4 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:46:57,351 [INFO] Auto preset chosen: #3 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,351 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:46:57,351 [INFO] ============================================================
+2026-07-26 19:46:57,351 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,367 [INFO] Content length: 392 chars
+2026-07-26 19:46:57,367 [INFO] Niche override: None
+2026-07-26 19:46:57,367 [INFO] Preset override: None
+2026-07-26 19:46:57,367 [INFO] ============================================================
+2026-07-26 19:46:57,367 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:46:57,367 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:46:57,367 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,367 [INFO] Generating configs for ~8 clips (avg duration: 6.8s)
+2026-07-26 19:46:57,376 [INFO] Config generated: 8 clips, niche=luxury_lifestyle, preset=#6, render=#49
+2026-07-26 19:46:57,377 [INFO] ============================================================
+2026-07-26 19:46:57,377 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,377 [INFO] Content length: 312 chars
+2026-07-26 19:46:57,377 [INFO] Niche override: None
+2026-07-26 19:46:57,377 [INFO] Preset override: None
+2026-07-26 19:46:57,377 [INFO] ============================================================
+2026-07-26 19:46:57,377 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:46:57,377 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:46:57,377 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,377 [INFO] Generating configs for ~13 clips (avg duration: 4.5s)
+2026-07-26 19:46:57,377 [INFO] Config generated: 13 clips, niche=quantum_future, preset=#5, render=#50
+2026-07-26 19:46:57,377 [INFO] ============================================================
+2026-07-26 19:46:57,377 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,377 [INFO] Content length: 308 chars
+2026-07-26 19:46:57,377 [INFO] Niche override: None
+2026-07-26 19:46:57,377 [INFO] Preset override: None
+2026-07-26 19:46:57,377 [INFO] ============================================================
+2026-07-26 19:46:57,393 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:46:57,393 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:46:57,393 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,393 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:46:57,399 [INFO] Config generated: 10 clips, niche=mystery, preset=#5, render=#51
+2026-07-26 19:46:57,399 [INFO] ============================================================
+2026-07-26 19:46:57,399 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,399 [INFO] Content length: 343 chars
+2026-07-26 19:46:57,399 [INFO] Niche override: None
+2026-07-26 19:46:57,399 [INFO] Preset override: None
+2026-07-26 19:46:57,399 [INFO] ============================================================
+2026-07-26 19:46:57,399 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:46:57,399 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:46:57,399 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:46:57,399 [INFO] Generating configs for ~8 clips (avg duration: 7.0s)
+2026-07-26 19:46:57,411 [INFO] Config generated: 8 clips, niche=stoic_wisdom, preset=#6, render=#52
+2026-07-26 19:46:57,411 [INFO] ============================================================
+2026-07-26 19:46:57,411 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,411 [INFO] Content length: 36 chars
+2026-07-26 19:46:57,411 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:46:57,411 [INFO] Preset override: 4
+2026-07-26 19:46:57,411 [INFO] ============================================================
+2026-07-26 19:46:57,411 [INFO] Generating configs for ~10 clips (avg duration: 4.1s)
+2026-07-26 19:46:57,411 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#4, render=#53
+2026-07-26 19:46:57,411 [INFO] ============================================================
+2026-07-26 19:46:57,411 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,411 [INFO] Content length: 14 chars
+2026-07-26 19:46:57,427 [INFO] Niche override: default
+2026-07-26 19:46:57,427 [INFO] Preset override: 1
+2026-07-26 19:46:57,427 [INFO] ============================================================
+2026-07-26 19:46:57,427 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:46:57,432 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#54
+2026-07-26 19:46:57,432 [INFO] ============================================================
+2026-07-26 19:46:57,432 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,432 [INFO] Content length: 14 chars
+2026-07-26 19:46:57,432 [INFO] Niche override: default
+2026-07-26 19:46:57,432 [INFO] Preset override: 1
+2026-07-26 19:46:57,432 [INFO] ============================================================
+2026-07-26 19:46:57,438 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:46:57,438 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#55
+2026-07-26 19:46:57,438 [INFO] ============================================================
+2026-07-26 19:46:57,438 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,438 [INFO] Content length: 0 chars
+2026-07-26 19:46:57,438 [INFO] Niche override: default
+2026-07-26 19:46:57,438 [INFO] Preset override: 1
+2026-07-26 19:46:57,438 [INFO] ============================================================
+2026-07-26 19:46:57,438 [INFO] Generating configs for ~3 clips (avg duration: 5.5s)
+2026-07-26 19:46:57,445 [INFO] Config generated: 3 clips, niche=default, preset=#1, render=#56
+2026-07-26 19:46:57,445 [INFO] ============================================================
+2026-07-26 19:46:57,445 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,445 [INFO] Content length: 5000 chars
+2026-07-26 19:46:57,445 [INFO] Niche override: None
+2026-07-26 19:46:57,445 [INFO] Preset override: None
+2026-07-26 19:46:57,445 [INFO] ============================================================
+2026-07-26 19:46:57,445 [WARNING] Brain failed: 7, falling back to keyword match
+2026-07-26 19:46:57,445 [INFO] No keywords matched, using default niche
+2026-07-26 19:46:57,445 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:46:57,445 [INFO] Generating configs for ~60 clips (avg duration: 4.3s)
+2026-07-26 19:46:57,456 [INFO] Config generated: 60 clips, niche=default, preset=#6, render=#57
+2026-07-26 19:46:57,456 [INFO] ============================================================
+2026-07-26 19:46:57,456 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,456 [INFO] Content length: 392 chars
+2026-07-26 19:46:57,456 [INFO] Niche override: None
+2026-07-26 19:46:57,456 [INFO] Preset override: None
+2026-07-26 19:46:57,456 [INFO] ============================================================
+2026-07-26 19:46:57,456 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:46:57,456 [INFO] Fallback detection: luxury_lifestyle (score=14)
+2026-07-26 19:46:57,456 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,456 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:46:57,472 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#1, render=#58
+2026-07-26 19:46:57,472 [INFO] ============================================================
+2026-07-26 19:46:57,472 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,472 [INFO] Content length: 312 chars
+2026-07-26 19:46:57,472 [INFO] Niche override: None
+2026-07-26 19:46:57,472 [INFO] Preset override: None
+2026-07-26 19:46:57,472 [INFO] ============================================================
+2026-07-26 19:46:57,472 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:46:57,472 [INFO] Fallback detection: quantum_future (score=26)
+2026-07-26 19:46:57,472 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,472 [INFO] Generating configs for ~11 clips (avg duration: 5.2s)
+2026-07-26 19:46:57,472 [INFO] Config generated: 11 clips, niche=quantum_future, preset=#2, render=#59
+2026-07-26 19:46:57,472 [INFO] ============================================================
+2026-07-26 19:46:57,472 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,472 [INFO] Content length: 308 chars
+2026-07-26 19:46:57,472 [INFO] Niche override: None
+2026-07-26 19:46:57,488 [INFO] Preset override: None
+2026-07-26 19:46:57,488 [INFO] ============================================================
+2026-07-26 19:46:57,488 [WARNING] Brain failed: 4, falling back to keyword match
+2026-07-26 19:46:57,488 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:46:57,488 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,494 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:46:57,494 [INFO] Config generated: 10 clips, niche=mystery, preset=#5, render=#60
+2026-07-26 19:46:57,494 [INFO] ============================================================
+2026-07-26 19:46:57,494 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,494 [INFO] Content length: 343 chars
+2026-07-26 19:46:57,494 [INFO] Niche override: None
+2026-07-26 19:46:57,494 [INFO] Preset override: None
+2026-07-26 19:46:57,494 [INFO] ============================================================
+2026-07-26 19:46:57,494 [WARNING] Brain failed: 6, falling back to keyword match
+2026-07-26 19:46:57,494 [INFO] Fallback detection: stoic_wisdom (score=22)
+2026-07-26 19:46:57,494 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:46:57,494 [INFO] Generating configs for ~15 clips (avg duration: 4.0s)
+2026-07-26 19:46:57,502 [INFO] Config generated: 15 clips, niche=stoic_wisdom, preset=#5, render=#61
+2026-07-26 19:46:57,502 [INFO] ============================================================
+2026-07-26 19:46:57,502 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,502 [INFO] Content length: 313 chars
+2026-07-26 19:46:57,502 [INFO] Niche override: None
+2026-07-26 19:46:57,502 [INFO] Preset override: None
+2026-07-26 19:46:57,502 [INFO] ============================================================
+2026-07-26 19:46:57,502 [WARNING] Brain failed: 5, falling back to keyword match
+2026-07-26 19:46:57,502 [INFO] Fallback detection: interior_design (score=22)
+2026-07-26 19:46:57,502 [INFO] Auto preset chosen: #2 (candidates=[1, 2, 5, 6], energy=0, calm=1)
+2026-07-26 19:46:57,508 [INFO] Generating configs for ~12 clips (avg duration: 5.0s)
+2026-07-26 19:46:57,508 [INFO] Config generated: 12 clips, niche=interior_design, preset=#2, render=#62
+2026-07-26 19:46:57,508 [INFO] ============================================================
+2026-07-26 19:46:57,508 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:46:57,508 [INFO] Content length: 315 chars
+2026-07-26 19:46:57,508 [INFO] Niche override: None
+2026-07-26 19:46:57,508 [INFO] Preset override: None
+2026-07-26 19:46:57,508 [INFO] ============================================================
+2026-07-26 19:46:57,508 [WARNING] Brain failed: 8, falling back to keyword match
+2026-07-26 19:46:57,508 [INFO] Fallback detection: finance_simulation (score=32)
+2026-07-26 19:46:57,508 [INFO] Auto preset chosen: #5 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:46:57,508 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:46:57,521 [INFO] Config generated: 10 clips, niche=finance_simulation, preset=#5, render=#63
+2026-07-26 19:50:34,100 [INFO] Fallback detection: luxury_lifestyle (score=8)
+2026-07-26 19:50:34,100 [INFO] Fallback detection: quantum_future (score=12)
+2026-07-26 19:50:34,100 [INFO] Fallback detection: mystery (score=12)
+2026-07-26 19:50:34,100 [INFO] Fallback detection: stoic_wisdom (score=10)
+2026-07-26 19:50:34,115 [INFO] Fallback detection: interior_design (score=10)
+2026-07-26 19:50:34,115 [INFO] Fallback detection: finance_simulation (score=12)
+2026-07-26 19:50:34,115 [INFO] Auto preset chosen: #7 (candidates=[3, 4, 7, 8], energy=0, calm=0)
+2026-07-26 19:50:34,115 [INFO] Auto preset chosen: #1 (candidates=[1, 2, 3, 5, 6, 7], energy=0, calm=0)
+2026-07-26 19:50:34,115 [INFO] Auto preset chosen: #6 (candidates=[1, 2, 5, 6], energy=0, calm=0)
+2026-07-26 19:50:34,115 [INFO] ============================================================
+2026-07-26 19:50:34,115 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,115 [INFO] Content length: 392 chars
+2026-07-26 19:50:34,115 [INFO] Niche override: None
+2026-07-26 19:50:34,115 [INFO] Preset override: None
+2026-07-26 19:50:34,115 [INFO] ============================================================
+2026-07-26 19:50:34,131 [INFO] Brain detected: niche=luxury_lifestyle, confidence=1.00
+2026-07-26 19:50:34,135 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:50:34,135 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#1, render=#64
+2026-07-26 19:50:34,135 [INFO] ============================================================
+2026-07-26 19:50:34,135 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,135 [INFO] Content length: 312 chars
+2026-07-26 19:50:34,135 [INFO] Niche override: None
+2026-07-26 19:50:34,135 [INFO] Preset override: None
+2026-07-26 19:50:34,135 [INFO] ============================================================
+2026-07-26 19:50:34,135 [INFO] Brain detected: niche=quantum_future, confidence=1.00
+2026-07-26 19:50:34,135 [INFO] Generating configs for ~13 clips (avg duration: 4.5s)
+2026-07-26 19:50:34,146 [INFO] Config generated: 13 clips, niche=quantum_future, preset=#5, render=#65
+2026-07-26 19:50:34,146 [INFO] ============================================================
+2026-07-26 19:50:34,146 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,146 [INFO] Content length: 308 chars
+2026-07-26 19:50:34,146 [INFO] Niche override: None
+2026-07-26 19:50:34,146 [INFO] Preset override: None
+2026-07-26 19:50:34,146 [INFO] ============================================================
+2026-07-26 19:50:34,146 [INFO] Brain detected: niche=mystery, confidence=1.00
+2026-07-26 19:50:34,146 [INFO] Generating configs for ~17 clips (avg duration: 3.5s)
+2026-07-26 19:50:34,157 [INFO] Config generated: 17 clips, niche=mystery, preset=#3, render=#66
+2026-07-26 19:50:34,157 [INFO] ============================================================
+2026-07-26 19:50:34,157 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,157 [INFO] Content length: 343 chars
+2026-07-26 19:50:34,157 [INFO] Niche override: None
+2026-07-26 19:50:34,157 [INFO] Preset override: None
+2026-07-26 19:50:34,157 [INFO] ============================================================
+2026-07-26 19:50:34,157 [INFO] Brain detected: niche=stoic_wisdom, confidence=1.00
+2026-07-26 19:50:34,157 [INFO] Generating configs for ~8 clips (avg duration: 7.0s)
+2026-07-26 19:50:34,157 [INFO] Config generated: 8 clips, niche=stoic_wisdom, preset=#6, render=#67
+2026-07-26 19:50:34,157 [INFO] ============================================================
+2026-07-26 19:50:34,157 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,172 [INFO] Content length: 36 chars
+2026-07-26 19:50:34,172 [INFO] Niche override: luxury_lifestyle
+2026-07-26 19:50:34,172 [INFO] Preset override: 4
+2026-07-26 19:50:34,172 [INFO] ============================================================
+2026-07-26 19:50:34,172 [INFO] Generating configs for ~10 clips (avg duration: 4.1s)
+2026-07-26 19:50:34,178 [INFO] Config generated: 10 clips, niche=luxury_lifestyle, preset=#4, render=#68
+2026-07-26 19:50:34,178 [INFO] ============================================================
+2026-07-26 19:50:34,178 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,178 [INFO] Content length: 14 chars
+2026-07-26 19:50:34,178 [INFO] Niche override: default
+2026-07-26 19:50:34,178 [INFO] Preset override: 1
+2026-07-26 19:50:34,178 [INFO] ============================================================
+2026-07-26 19:50:34,178 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:50:34,185 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#69
+2026-07-26 19:50:34,185 [INFO] ============================================================
+2026-07-26 19:50:34,185 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,185 [INFO] Content length: 14 chars
+2026-07-26 19:50:34,185 [INFO] Niche override: default
+2026-07-26 19:50:34,185 [INFO] Preset override: 1
+2026-07-26 19:50:34,185 [INFO] ============================================================
+2026-07-26 19:50:34,185 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:50:34,191 [INFO] Config generated: 10 clips, niche=default, preset=#1, render=#70
+2026-07-26 19:50:34,191 [INFO] ============================================================
+2026-07-26 19:50:34,191 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,191 [INFO] Content length: 0 chars
+2026-07-26 19:50:34,191 [INFO] Niche override: default
+2026-07-26 19:50:34,191 [INFO] Preset override: 1
+2026-07-26 19:50:34,191 [INFO] ============================================================
+2026-07-26 19:50:34,191 [INFO] Generating configs for ~3 clips (avg duration: 5.5s)
+2026-07-26 19:50:34,191 [INFO] Config generated: 3 clips, niche=default, preset=#1, render=#71
+2026-07-26 19:50:34,201 [INFO] ============================================================
+2026-07-26 19:50:34,201 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,201 [INFO] Content length: 5000 chars
+2026-07-26 19:50:34,201 [INFO] Niche override: None
+2026-07-26 19:50:34,201 [INFO] Preset override: None
+2026-07-26 19:50:34,201 [INFO] ============================================================
+2026-07-26 19:50:34,201 [INFO] Brain detected: niche=default, confidence=0.30
+2026-07-26 19:50:34,201 [INFO] Generating configs for ~60 clips (avg duration: 6.5s)
+2026-07-26 19:50:34,201 [INFO] Config generated: 60 clips, niche=default, preset=#7, render=#72
+2026-07-26 19:50:34,217 [INFO] ============================================================
+2026-07-26 19:50:34,217 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,217 [INFO] Content length: 392 chars
+2026-07-26 19:50:34,217 [INFO] Niche override: None
+2026-07-26 19:50:34,217 [INFO] Preset override: None
+2026-07-26 19:50:34,217 [INFO] ============================================================
+2026-07-26 19:50:34,217 [INFO] Brain detected: niche=luxury_lifestyle, confidence=1.00
+2026-07-26 19:50:34,226 [INFO] Generating configs for ~9 clips (avg duration: 6.2s)
+2026-07-26 19:50:34,226 [INFO] Config generated: 9 clips, niche=luxury_lifestyle, preset=#8, render=#73
+2026-07-26 19:50:34,226 [INFO] ============================================================
+2026-07-26 19:50:34,226 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,226 [INFO] Content length: 312 chars
+2026-07-26 19:50:34,226 [INFO] Niche override: None
+2026-07-26 19:50:34,226 [INFO] Preset override: None
+2026-07-26 19:50:34,226 [INFO] ============================================================
+2026-07-26 19:50:34,226 [INFO] Brain detected: niche=quantum_future, confidence=1.00
+2026-07-26 19:50:34,226 [INFO] Generating configs for ~10 clips (avg duration: 5.8s)
+2026-07-26 19:50:34,237 [INFO] Config generated: 10 clips, niche=quantum_future, preset=#7, render=#74
+2026-07-26 19:50:34,237 [INFO] ============================================================
+2026-07-26 19:50:34,237 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,237 [INFO] Content length: 308 chars
+2026-07-26 19:50:34,237 [INFO] Niche override: None
+2026-07-26 19:50:34,237 [INFO] Preset override: None
+2026-07-26 19:50:34,237 [INFO] ============================================================
+2026-07-26 19:50:34,237 [INFO] Brain detected: niche=mystery, confidence=1.00
+2026-07-26 19:50:34,247 [INFO] Generating configs for ~10 clips (avg duration: 5.5s)
+2026-07-26 19:50:34,247 [INFO] Config generated: 10 clips, niche=mystery, preset=#5, render=#75
+2026-07-26 19:50:34,247 [INFO] ============================================================
+2026-07-26 19:50:34,247 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,247 [INFO] Content length: 343 chars
+2026-07-26 19:50:34,247 [INFO] Niche override: None
+2026-07-26 19:50:34,247 [INFO] Preset override: None
+2026-07-26 19:50:34,247 [INFO] ============================================================
+2026-07-26 19:50:34,247 [INFO] Brain detected: niche=stoic_wisdom, confidence=1.00
+2026-07-26 19:50:34,256 [INFO] Generating configs for ~9 clips (avg duration: 6.5s)
+2026-07-26 19:50:34,257 [INFO] Config generated: 9 clips, niche=stoic_wisdom, preset=#1, render=#76
+2026-07-26 19:50:34,257 [INFO] ============================================================
+2026-07-26 19:50:34,257 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,257 [INFO] Content length: 313 chars
+2026-07-26 19:50:34,257 [INFO] Niche override: None
+2026-07-26 19:50:34,257 [INFO] Preset override: None
+2026-07-26 19:50:34,257 [INFO] ============================================================
+2026-07-26 19:50:34,257 [INFO] Brain detected: niche=interior_design, confidence=1.00
+2026-07-26 19:50:34,266 [INFO] Generating configs for ~11 clips (avg duration: 5.2s)
+2026-07-26 19:50:34,266 [INFO] Config generated: 11 clips, niche=interior_design, preset=#1, render=#77
+2026-07-26 19:50:34,266 [INFO] ============================================================
+2026-07-26 19:50:34,266 [INFO] ANALYZE & GET CONFIG
+2026-07-26 19:50:34,266 [INFO] Content length: 315 chars
+2026-07-26 19:50:34,266 [INFO] Niche override: None
+2026-07-26 19:50:34,266 [INFO] Preset override: None
+2026-07-26 19:50:34,266 [INFO] ============================================================
+2026-07-26 19:50:34,266 [INFO] Brain detected: niche=finance_simulation, confidence=1.00
+2026-07-26 19:50:34,266 [INFO] Generating configs for ~20 clips (avg duration: 3.0s)
+2026-07-26 19:50:34,266 [INFO] Config generated: 20 clips, niche=finance_simulation, preset=#3, render=#78

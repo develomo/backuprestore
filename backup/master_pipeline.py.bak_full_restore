@@ -1,0 +1,187 @@
+import shutil
+import numpy as np
+
+def apply_green_screen_mask(cta_clip):
+    """Removes green screen background from CTA overlay video clips."""
+    try:
+        def make_mask(frame):
+            r = frame[:, :, 0].astype(float)
+            g = frame[:, :, 1].astype(float)
+            b = frame[:, :, 2].astype(float)
+            is_green = (g > 90) & (g > r * 1.25) & (g > b * 1.25)
+            mask = np.ones((frame.shape[0], frame.shape[1]), dtype=float)
+            mask[is_green] = 0.0
+            return mask
+
+        mask_clip = cta_clip.fl_image(make_mask)
+        return cta_clip.set_mask(mask_clip)
+    except Exception:
+        return cta_clip
+
+
+from caption_engine import apply_captions_to_video
+import os
+import traceback
+import numpy as np
+from PIL import Image
+
+def apply_color_grading(clip, preset, clip_index=1):
+    """Applies non-destructive LUT / Color adjustments"""
+    p = str(preset).lower() if preset else 'standard'
+    
+    if 'standard' in p or 'none' in p or not preset:
+        print(f'     [COLOR] Clip #{clip_index}: Standard Neutral (Original Colors Kept)')
+        return clip, True
+
+    print(f'     [COLOR] Clip #{clip_index}: Applying Non-Destructive Filter "{preset.upper()}"...')
+
+    def filter_frame(get_frame, t):
+        frame = get_frame(t).astype(float)
+        if 'cinematic' in p or 'warm' in p:
+            frame[:, :, 0] = np.clip(frame[:, :, 0] * 1.10 + 8, 0, 255)
+            frame[:, :, 1] = np.clip(frame[:, :, 1] * 1.03, 0, 255)
+            frame[:, :, 2] = np.clip(frame[:, :, 2] * 0.90, 0, 255)
+        elif 'cyberpunk' in p or 'neon' in p:
+            frame[:, :, 0] = np.clip(frame[:, :, 0] * 1.15, 0, 255)
+            frame[:, :, 2] = np.clip(frame[:, :, 2] * 1.20 + 10, 0, 255)
+        elif 'vibrant' in p or 'vivid' in p:
+            mean = np.mean(frame, axis=2, keepdims=True)
+            frame = np.clip((frame - mean) * 1.20 + mean + 3, 0, 255)
+        return frame.astype(np.uint8)
+
+    return clip.fl(filter_frame), True
+
+def apply_subtle_effects_and_motion(clip, clip_index=1):
+    """Low-intensity motion zoom & subtle vignette to preserve native clip resolution"""
+    dur = clip.duration if clip.duration and clip.duration > 0 else 1.0
+    
+    def process_frame(get_frame, t):
+        frame = get_frame(t)
+        h, w, c = frame.shape
+        
+        # 1. Subtle Resolution-Safe Zoom (Max 5% Scale)
+        scale = 1.0 + 0.05 * (t / dur)
+        nw, nh = int(w * scale), int(h * scale)
+        img = Image.fromarray(frame).resize((nw, nh), Image.Resampling.LANCZOS)
+        cx, cy = (nw - w) // 2, (nh - h) // 2
+        img_cropped = img.crop((cx, cy, cx + w, cy + h))
+        arr = np.array(img_cropped).astype(float)
+
+        # 2. Low Intensity Vignette (Soft Edges Only)
+        x = np.linspace(-1, 1, w)
+        y = np.linspace(-1, 1, h)
+        X, Y = np.meshgrid(x, y)
+        vignette_mask = 1 - 0.15 * (X**2 + Y**2)
+        vignette_mask = np.clip(vignette_mask, 0.85, 1.0)[:, :, np.newaxis]
+        
+        arr = np.clip(arr * vignette_mask, 0, 255).astype(np.uint8)
+        return arr
+
+    print(f'     [SUBTLE FX & MOTION] Clip #{clip_index}: Applied Low-Intensity Zoom & Safe Vignette')
+    return clip.fl(process_frame)
+
+
+
+def process_multi_clip_render(clips_list, audio_path, output_path, settings=None):
+    import os
+    import shutil
+    import numpy as np
+    from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips
+
+    print("\n======================================================================")
+    print("🎬 MASTER CREATORFLOW SHORT VIDEO ENGINE - CLEAN RENDER")
+    print("======================================================================\n")
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir and not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    # 1. Load Audio
+    voice_audio = AudioFileClip(audio_path)
+    target_duration = voice_audio.duration
+    print(f"[STEP 1/5] Voice Audio Loaded (Duration: {target_duration:.2f}s)")
+
+    # 2. Process Video Clips
+    loaded_clips = []
+    for cp in clips_list:
+        if os.path.exists(cp):
+            try:
+                clip = VideoFileClip(cp)
+                loaded_clips.append(clip)
+            except Exception as e:
+                print(f"[WARN] Could not load clip {cp}: {e}")
+
+    if not loaded_clips:
+        raise FileNotFoundError("No valid video clips were loaded.")
+
+    # Concatenate clips to match audio duration
+    combined_video = concatenate_videoclips(loaded_clips, method="compose")
+    if combined_video.duration < target_duration:
+        combined_video = combined_video.loop(duration=target_duration)
+    else:
+        combined_video = combined_video.subclip(0, target_duration)
+
+    final_video = combined_video.set_audio(voice_audio)
+
+    # 3. Write Base Video to Disk (File Lock Safe)
+    temp_export = output_path.replace(".mp4", "_temp_raw.mp4")
+    if os.path.exists(temp_export):
+        try:
+            os.remove(temp_export)
+        except Exception:
+            pass
+
+    print("\n[EXPORT] WRITING FINAL MP4 FILE TO DISK...")
+    final_video.write_videofile(
+        temp_export,
+        fps=30,
+        codec="libx264",
+        audio_codec="aac",
+        threads=2,
+        preset="medium"
+    )
+
+    # Close clips to release Windows locks
+    try:
+        final_video.close()
+        voice_audio.close()
+        for c in loaded_clips:
+            c.close()
+    except Exception:
+        pass
+
+    # 4. Burn-in Captions / Subtitles if enabled
+    captions_applied = False
+    if os.path.exists(temp_export):
+        try:
+            cfg = settings.get('caption_config', {}) if settings else {"enabled": True}
+            if cfg.get('enabled', True) and 'process_video_with_captions' in globals():
+                print("\n[STEP 6/6] BURNING DYNAMIC SUBTITLES INTO MP4...")
+                process_video_with_captions(temp_export, cfg, output_path)
+                captions_applied = True
+                print("[CAPTION ENGINE] Subtitles successfully burned into MP4!")
+        except Exception as cap_err:
+            print(f"[WARN] Caption burn failed: {cap_err}")
+
+    # Move file if captions skipped or failed
+    if not captions_applied or not os.path.exists(output_path):
+        if os.path.exists(temp_export):
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            shutil.move(temp_export, output_path)
+
+    if os.path.exists(temp_export):
+        try:
+            os.remove(temp_export)
+        except Exception:
+            pass
+
+    print("\n======================================================================")
+    print("[SUCCESS] RENDER COMPLETE!")
+    print(f"🎯 Output File: {output_path}")
+    print("======================================================================\n")
+
+    return output_path

@@ -1,0 +1,22 @@
+Comparing files app.py and APP.PY.BAK_FIX
+***** app.py
+
+def _phase13_merge_preset(existing=None, mode="LONG", settings=None, assets=None, add_captions = True, caption_mode="none", sty
+le_id=None):
+    settings = settings or {}
+***** APP.PY.BAK_FIX
+
+def _phase13_merge_preset(existing=None, mode="LONG", settings=None, assets=None, add_captions=False, caption_mode="none", styl
+e_id=None):
+    settings = settings or {}
+*****
+
+***** app.py
+
+
+    raise RuntimeError("Phase 13 app router could not find previous run_render function.")
+***** APP.PY.BAK_FIX
+
+    raise RuntimeError("Phase 13 app router could not find previous run_render function.")
+*****
+

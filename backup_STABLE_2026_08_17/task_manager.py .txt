@@ -1,0 +1,987 @@
+# task_manager.py
+# ==========================================================
+# MY CREATION VIDEO GENERATOR — PHASE 2
+# TASK MANAGER v1.0 — Render Queue & Job Manager
+# ==========================================================
+#
+# PURPOSE:
+# - Multiple render jobs ko queue mein manage karna
+# - Pause / Resume / Cancel individual jobs
+# - Retry failed jobs with configurable attempts
+# - Priority-based job scheduling
+# - Job history with status tracking
+# - Concurrent job limiting (ek waqt mein sirf N jobs)
+# - Graceful shutdown with state persistence
+# - Crash recovery via state file
+#
+# ARCHITECTURE:
+# ┌─────────────────────────────────────────────────────────┐
+# │                    TaskManager                           │
+# │                                                         │
+# │  ┌──────────────────┐    ┌─────────────────────────┐   │
+# │  │   Job Queue       │    │   Active Jobs Pool      │   │
+# │  │   (Priority)      │───▶│   (max N concurrent)    │   │
+# │  └──────────────────┘    └───────────┬─────────────┘   │
+# │                                      │                  │
+# │                        ┌─────────────▼──────────────┐  │
+# │                        │   RenderOrchestrator       │  │
+# │                        │   (one per active job)     │  │
+# │                        └─────────────┬──────────────┘  │
+# │                                      │                  │
+# │  ┌──────────────────┐    ┌───────────▼──────────────┐  │
+# │  │   Job History     │◀───│   Completed/Cancelled    │  │
+# │  │   (persisted)     │    │   Jobs                   │  │
+# │  └──────────────────┘    └──────────────────────────┘  │
+# └─────────────────────────────────────────────────────────┘
+# ==========================================================
+
+from __future__ import annotations
+
+import os
+import gc
+import json
+import time
+import uuid
+import shutil
+import signal
+import logging
+import threading
+import traceback
+from queue import PriorityQueue
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from enum import Enum
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger("TaskManager")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.handlers.clear()
+    logger.addHandler(_handler)
+
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+try:
+    from render_orchestrator import RenderOrchestrator, RenderJobConfig, PipelineStage
+    HAS_ORCHESTRATOR = True
+except ImportError:
+    HAS_ORCHESTRATOR = False
+    logger.warning("render_orchestrator.py not available")
+
+
+# ============================================================
+# JOB STATUS ENUM
+# ============================================================
+
+class JobStatus(Enum):
+    """Possible states for a render job."""
+    QUEUED = "queued"           # Waiting in queue
+    PREPARING = "preparing"     # Validating & loading
+    RENDERING = "rendering"     # Rendering clips
+    ASSEMBLING = "assembling"   # Assembling video
+    POST_PROCESSING = "post_processing"  # Captions, watermark
+    AUDIO_MIXING = "audio_mixing"        # Audio mixing
+    FINALIZING = "finalizing"   # Final output
+    COMPLETED = "completed"     # Successfully finished
+    FAILED = "failed"           # Failed with error
+    CANCELLED = "cancelled"     # User cancelled
+    PAUSED = "paused"           # Temporarily paused
+    
+    @property
+    def is_terminal(self) -> bool:
+        """Is this a terminal state?"""
+        return self in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+    
+    @property
+    def is_active(self) -> bool:
+        """Is the job currently active?"""
+        return self in (JobStatus.PREPARING, JobStatus.RENDERING,
+                       JobStatus.ASSEMBLING, JobStatus.POST_PROCESSING,
+                       JobStatus.AUDIO_MIXING, JobStatus.FINALIZING)
+
+
+# ============================================================
+# JOB PRIORITY
+# ============================================================
+
+class JobPriority:
+    """Priority levels for render jobs."""
+    URGENT = 0     # Process immediately
+    HIGH = 25      # Process before normal
+    NORMAL = 50    # Default priority
+    LOW = 75       # Process after normal
+    BACKGROUND = 100  # Process when idle
+    
+    @staticmethod
+    def from_str(s: str) -> int:
+        mapping = {
+            "urgent": 0, "high": 25,
+            "normal": 50, "low": 75, "background": 100,
+        }
+        return mapping.get(str(s).lower(), 50)
+
+
+# ============================================================
+# RENDER JOB
+# ============================================================
+
+@dataclass
+class RenderJob:
+    """
+    A single render job in the task queue.
+    
+    Contains:
+    - Unique job ID
+    - Render configuration
+    - Current status
+    - Progress tracking
+    - Error logs
+    - Timestamps
+    """
+    # Core
+    id: str = field(default_factory=lambda: f"job_{uuid.uuid4().hex[:12]}")
+    name: str = "Untitled Render"
+    config: Optional[Dict] = None  # Serialized RenderJobConfig
+    config_obj: Optional[Any] = None  # Actual RenderJobConfig object
+    
+    # Status
+    status: JobStatus = JobStatus.QUEUED
+    priority: int = JobPriority.NORMAL
+    retry_count: int = 0
+    max_retries: int = 2
+    
+    # Progress
+    progress_pct: float = 0.0
+    current_stage: str = ""
+    total_clips: int = 0
+    clips_completed: int = 0
+    estimated_remaining_seconds: float = float('inf')
+    
+    # Output
+    output_path: str = ""
+    report: Optional[Dict] = None
+    
+    # Errors
+    error_message: str = ""
+    error_traceback: str = ""
+    warnings: List[str] = field(default_factory=list)
+    
+    # Timestamps
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    elapsed_seconds: float = 0.0
+    
+    # Control
+    _cancel_flag: Any = field(default_factory=threading.Event)
+    _pause_flag: Any = field(default_factory=threading.Event)
+    
+    def to_dict(self) -> dict:
+        """Serialize to dict for persistence."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "status": self.status.value,
+            "priority": self.priority,
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+            "progress_pct": self.progress_pct,
+            "current_stage": self.current_stage,
+            "total_clips": self.total_clips,
+            "clips_completed": self.clips_completed,
+            "estimated_remaining_seconds": self.estimated_remaining_seconds,
+            "output_path": self.output_path,
+            "error_message": self.error_message,
+            "warnings": self.warnings,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> "RenderJob":
+        """Deserialize from dict."""
+        job = cls(
+            id=data.get("id", ""),
+            name=data.get("name", "Untitled"),
+        )
+        job.status = JobStatus(data.get("status", "queued"))
+        job.priority = data.get("priority", 50)
+        job.retry_count = data.get("retry_count", 0)
+        job.max_retries = data.get("max_retries", 2)
+        job.progress_pct = data.get("progress_pct", 0.0)
+        job.current_stage = data.get("current_stage", "")
+        job.total_clips = data.get("total_clips", 0)
+        job.clips_completed = data.get("clips_completed", 0)
+        job.estimated_remaining_seconds = data.get("estimated_remaining_seconds", float('inf'))
+        job.output_path = data.get("output_path", "")
+        job.error_message = data.get("error_message", "")
+        job.warnings = data.get("warnings", [])
+        job.created_at = data.get("created_at", "")
+        job.started_at = data.get("started_at")
+        job.completed_at = data.get("completed_at")
+        job.elapsed_seconds = data.get("elapsed_seconds", 0.0)
+        return job
+    
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_flag.is_set()
+    
+    @property
+    def is_paused(self) -> bool:
+        return self._pause_flag.is_set()
+    
+    def cancel(self):
+        """Request cancellation."""
+        self._cancel_flag.set()
+    
+    def pause(self):
+        """Request pause."""
+        self._pause_flag.set()
+    
+    def resume(self):
+        """Resume from pause."""
+        self._pause_flag.clear()
+    
+    @property
+    def summary(self) -> str:
+        """One-line job summary."""
+        return (f"[{self.id}] {self.name} | {self.status.value} | "
+                f"{self.progress_pct:.0f}% | "
+                f"clips: {self.clips_completed}/{self.total_clips}")
+
+
+# ============================================================
+# TASK MANAGER — MAIN CLASS
+# ============================================================
+
+class TaskManager:
+    """
+    Central job queue manager for Phase 2 renders.
+    
+    FEATURES:
+    - Priority queue for pending jobs
+    - Concurrent job limiting (max N active)
+    - Pause / Resume / Cancel per job
+    - Crash recovery from state file
+    - Job history with filtering
+    - Progress tracking across all jobs
+    - Automatic retry for failed jobs
+    - Graceful shutdown (completes active jobs)
+    
+    USAGE:
+        manager = TaskManager(max_concurrent=2)
+        
+        # Add jobs
+        job_id = manager.add_job(
+            config=render_config,
+            name="My Video",
+            priority="normal",
+        )
+        
+        # Start processing
+        manager.start()
+        
+        # Check status
+        status = manager.get_job_status(job_id)
+        
+        # Control
+        manager.pause_job(job_id)
+        manager.resume_job(job_id)
+        manager.cancel_job(job_id)
+        
+        # Get history
+        completed = manager.get_completed_jobs()
+        failed = manager.get_failed_jobs()
+        
+        # Shutdown
+        manager.shutdown(wait=True)
+    """
+    
+    def __init__(
+        self,
+        max_concurrent: int = 2,
+        state_file: Optional[str] = None,
+        auto_retry: bool = True,
+        max_retries: int = 2,
+        history_limit: int = 100,
+    ):
+        """
+        Initialize task manager.
+        
+        Args:
+            max_concurrent: Max simultaneous renders
+            state_file: Path for state persistence (crash recovery)
+            auto_retry: Automatically retry failed jobs
+            max_retries: Max retry attempts per job
+            history_limit: Max jobs to keep in memory
+        """
+        # Queue
+        self._pending_queue: PriorityQueue = PriorityQueue()
+        self._active_jobs: Dict[str, RenderJob] = {}
+        self._all_jobs: Dict[str, RenderJob] = {}
+        self._history: List[RenderJob] = []
+        
+        # Settings
+        self.max_concurrent = max(1, max_concurrent)
+        self.auto_retry = auto_retry
+        self.default_max_retries = max_retries
+        self.history_limit = history_limit
+        self.state_file = Path(state_file) if state_file else Path("task_manager_state.json")
+        
+        # Threading
+        self._lock = threading.RLock()
+        self._scheduler_thread: Optional[threading.Thread] = None
+        self._active_threads: Dict[str, threading.Thread] = {}
+        self._running = False
+        self._shutdown_flag = threading.Event()
+        
+        # Callbacks
+        self._callbacks: Dict[str, List[Callable]] = {
+            "job_started": [],
+            "job_completed": [],
+            "job_failed": [],
+            "job_cancelled": [],
+            "job_progress": [],
+            "queue_empty": [],
+        }
+        
+        # Load state (crash recovery)
+        self._load_state()
+        
+        logger.info(f"TaskManager initialized | max_concurrent={max_concurrent} | "
+                    f"jobs_in_memory={len(self._all_jobs)}")
+    
+    # ================================================================
+    # STATE PERSISTENCE
+    # ================================================================
+    
+    def _save_state(self):
+        """Save all job states to disk."""
+        try:
+            data = {
+                "saved_at": datetime.now().isoformat(),
+                "jobs": {jid: job.to_dict() for jid, job in self._all_jobs.items()},
+            }
+            self.state_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+    
+    def _load_state(self):
+        """Load job states from disk (crash recovery)."""
+        if not self.state_file.exists():
+            return
+        
+        try:
+            data = json.loads(self.state_file.read_text(encoding="utf-8"))
+            saved_at = data.get("saved_at", "unknown")
+            
+            for jid, job_data in data.get("jobs", {}).items():
+                job = RenderJob.from_dict(job_data)
+                
+                # Reset active jobs to queued (they were interrupted)
+                if job.status.is_active:
+                    logger.warning(f"Recovering interrupted job: {job.id}")
+                    job.status = JobStatus.QUEUED
+                    job.error_message = "Recovered after crash"
+                
+                # Keep only non-terminal jobs in memory
+                if not job.status.is_terminal:
+                    self._all_jobs[job.id] = job
+                    if job.status == JobStatus.QUEUED:
+                        self._pending_queue.put((job.priority, job.id, job))
+                else:
+                    self._history.append(job)
+            
+            logger.info(f"State loaded: {saved_at} | "
+                       f"{len(self._all_jobs)} active, {len(self._history)} history")
+            
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+    
+    # ================================================================
+    # JOB MANAGEMENT
+    # ================================================================
+    
+    def add_job(
+        self,
+        config: Any,  # RenderJobConfig
+        name: str = "Untitled Render",
+        priority: Union[str, int] = "normal",
+        max_retries: Optional[int] = None,
+    ) -> str:
+        """
+        Add a new render job to the queue.
+        
+        Args:
+            config: RenderJobConfig object
+            name: Human-readable job name
+            priority: "urgent", "high", "normal", "low", or integer 0-100
+            max_retries: Override default max retries
+        
+        Returns:
+            Job ID string
+        """
+        with self._lock:
+            if isinstance(priority, str):
+                priority = JobPriority.from_str(priority)
+            
+            job = RenderJob(
+                name=name,
+                config_obj=config,
+                priority=priority,
+                max_retries=max_retries if max_retries is not None else self.default_max_retries,
+            )
+            
+            # Serialize config for persistence
+            if hasattr(config, '__dataclass_fields__'):
+                job.config = {
+                    f.name: str(getattr(config, f.name))
+                    for f in config.__dataclass_fields__.values()
+                }
+                job.total_clips = len(getattr(config, 'clip_paths', []))
+            
+            self._all_jobs[job.id] = job
+            self._pending_queue.put((priority, job.id, job))
+            
+            self._save_state()
+            
+            logger.info(f"Job added: {job.summary}")
+            
+            # Trigger scheduler if running
+            if self._running:
+                self._process_next_job()
+            
+            return job.id
+    
+    def get_job(self, job_id: str) -> Optional[RenderJob]:
+        """Get job by ID."""
+        with self._lock:
+            return self._all_jobs.get(job_id)
+    
+    def get_job_status(self, job_id: str) -> Optional[dict]:
+        """Get job status as dict."""
+        job = self.get_job(job_id)
+        return job.to_dict() if job else None
+    
+    def pause_job(self, job_id: str) -> bool:
+        """Pause an active job."""
+        with self._lock:
+            job = self._all_jobs.get(job_id)
+            if not job or not job.status.is_active:
+                return False
+            
+            job.pause()
+            job.status = JobStatus.PAUSED
+            logger.info(f"Job paused: {job_id}")
+            self._save_state()
+            return True
+    
+    def resume_job(self, job_id: str) -> bool:
+        """Resume a paused job."""
+        with self._lock:
+            job = self._all_jobs.get(job_id)
+            if not job or job.status != JobStatus.PAUSED:
+                return False
+            
+            job.resume()
+            job.status = JobStatus.QUEUED
+            self._pending_queue.put((job.priority, job.id, job))
+            logger.info(f"Job resumed: {job_id}")
+            self._save_state()
+            
+            if self._running:
+                self._process_next_job()
+            return True
+    
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a job (pending, active, or paused)."""
+        with self._lock:
+            job = self._all_jobs.get(job_id)
+            if not job:
+                return False
+            
+            if job.status.is_terminal:
+                return False
+            
+            job.cancel()
+            job.status = JobStatus.CANCELLED
+            job.completed_at = datetime.now().isoformat()
+            
+            # Move to history
+            self._history.append(job)
+            self._all_jobs.pop(job.id, None)
+            self._active_jobs.pop(job.id, None)
+            
+            self._fire("job_cancelled", job)
+            logger.info(f"Job cancelled: {job_id}")
+            self._save_state()
+            
+            # Free up slot for next job
+            if self._running:
+                self._process_next_job()
+            
+            return True
+    
+    def retry_job(self, job_id: str) -> bool:
+        """Retry a failed job."""
+        with self._lock:
+            job = self._all_jobs.get(job_id)
+            if not job or job.status != JobStatus.FAILED:
+                return False
+            
+            if job.retry_count >= job.max_retries:
+                logger.warning(f"Cannot retry {job_id}: max retries ({job.max_retries}) reached")
+                return False
+            
+            job.retry_count += 1
+            job.status = JobStatus.QUEUED
+            job.error_message = ""
+            job.error_traceback = ""
+            job.progress_pct = 0.0
+            job._cancel_flag.clear()
+            job._pause_flag.clear()
+            
+            self._pending_queue.put((job.priority, job.id, job))
+            
+            logger.info(f"Job retry #{job.retry_count}: {job_id}")
+            self._save_state()
+            
+            if self._running:
+                self._process_next_job()
+            
+            return True
+    
+    # ================================================================
+    # JOB EXECUTION
+    # ================================================================
+    
+    def _execute_job(self, job: RenderJob):
+        """
+        Execute a single render job in a thread.
+        
+        This runs the RenderOrchestrator for the job.
+        """
+        job.started_at = datetime.now().isoformat()
+        job.status = JobStatus.PREPARING
+        
+        self._fire("job_started", job)
+        
+        try:
+            if not HAS_ORCHESTRATOR:
+                raise RuntimeError("RenderOrchestrator not available")
+            
+            orch = RenderOrchestrator()
+            
+            # Wire progress callback
+            def on_progress(progress):
+                job.progress_pct = progress.stage_progress_pct
+                job.current_stage = progress.stage.value
+                job.clips_completed = progress.clips_rendered
+                job.estimated_remaining_seconds = progress.estimated_remaining_seconds
+                self._fire("job_progress", job)
+                
+                # Check pause/cancel
+                if job.is_paused:
+                    job.status = JobStatus.PAUSED
+                    while job.is_paused and not job.is_cancelled:
+                        time.sleep(1.0)
+                    if not job.is_cancelled:
+                        job.status = JobStatus.RENDERING
+                
+                if job.is_cancelled:
+                    orch.cancel()
+            
+            orch.on_progress(on_progress)
+            
+            # Run the render
+            result = orch.render(job.config_obj)
+            
+            if result["success"]:
+                job.status = JobStatus.COMPLETED
+                job.output_path = result["output_path"]
+                job.report = result["report"]
+                job.progress_pct = 100.0
+                self._fire("job_completed", job)
+                logger.info(f"Job completed: {job.id} → {job.output_path}")
+            else:
+                job.status = JobStatus.FAILED
+                job.error_message = result.get("errors", ["Unknown error"])[0]
+                job.report = result.get("report", {})
+                self._fire("job_failed", job)
+                logger.error(f"Job failed: {job.id} → {job.error_message}")
+                
+                # Auto-retry
+                if self.auto_retry and job.retry_count < job.max_retries:
+                    logger.info(f"Auto-retrying {job.id} "
+                              f"(attempt {job.retry_count + 1}/{job.max_retries})")
+                    self.retry_job(job.id)
+            
+        except Exception as e:
+            job.status = JobStatus.FAILED
+            job.error_message = str(e)
+            job.error_traceback = traceback.format_exc()
+            self._fire("job_failed", job)
+            logger.error(f"Job crashed: {job.id} → {e}")
+            
+            if self.auto_retry and job.retry_count < job.max_retries:
+                self.retry_job(job.id)
+        
+        finally:
+            job.completed_at = datetime.now().isoformat()
+            if job.started_at:
+                job.elapsed_seconds = (
+                    datetime.fromisoformat(job.completed_at) -
+                    datetime.fromisoformat(job.started_at)
+                ).total_seconds()
+            
+            with self._lock:
+                # Move to history if terminal
+                if job.status.is_terminal:
+                    self._active_jobs.pop(job.id, None)
+                    self._history.append(job)
+                    self._trim_history()
+            
+            self._save_state()
+            
+            # Process next job
+            if self._running:
+                self._process_next_job()
+    
+    def _process_next_job(self):
+        """
+        Start next pending job if slots available.
+        
+        This is the scheduler — checks if we can start more jobs.
+        """
+        with self._lock:
+            while len(self._active_jobs) < self.max_concurrent:
+                try:
+                    priority, job_id, job = self._pending_queue.get_nowait()
+                    
+                    if job_id not in self._all_jobs:
+                        continue
+                    
+                    if job.status != JobStatus.QUEUED:
+                        continue
+                    
+                    self._active_jobs[job_id] = job
+                    
+                    # Start job in thread
+                    thread = threading.Thread(
+                        target=self._execute_job,
+                        args=(job,),
+                        name=f"RenderJob-{job_id[:8]}",
+                        daemon=True,
+                    )
+                    self._active_threads[job_id] = thread
+                    thread.start()
+                    
+                    logger.info(f"Job started: {job.summary} | "
+                              f"active={len(self._active_jobs)}/{self.max_concurrent}")
+                    
+                except Exception:
+                    # Queue empty or error — stop
+                    break
+    
+    # ================================================================
+    # SCHEDULER CONTROL
+    # ================================================================
+    
+    def start(self):
+        """Start the job scheduler."""
+        if self._running:
+            logger.warning("Scheduler already running")
+            return
+        
+        self._running = True
+        self._shutdown_flag.clear()
+        logger.info("Scheduler started")
+        
+        # Process pending jobs
+        self._process_next_job()
+    
+    def shutdown(self, wait: bool = True, timeout: Optional[float] = None):
+        """
+        Gracefully shut down the scheduler.
+        
+        Args:
+            wait: If True, wait for active jobs to complete
+            timeout: Max seconds to wait (None = forever)
+        """
+        logger.info("Shutdown requested")
+        self._running = False
+        self._shutdown_flag.set()
+        
+        if wait:
+            start = time.time()
+            while self._active_jobs:
+                if timeout and time.time() - start > timeout:
+                    logger.warning(f"Shutdown timeout after {timeout}s")
+                    break
+                time.sleep(1.0)
+        
+        self._save_state()
+        logger.info("Scheduler shut down")
+    
+    @property
+    def is_running(self) -> bool:
+        return self._running
+    
+    # ================================================================
+    # QUERY METHODS
+    # ================================================================
+    
+    def get_active_jobs(self) -> List[RenderJob]:
+        """Get all currently active jobs."""
+        with self._lock:
+            return list(self._active_jobs.values())
+    
+    def get_queued_jobs(self) -> List[RenderJob]:
+        """Get all jobs waiting in queue."""
+        with self._lock:
+            return [
+                j for j in self._all_jobs.values()
+                if j.status == JobStatus.QUEUED
+            ]
+    
+    def get_paused_jobs(self) -> List[RenderJob]:
+        """Get all paused jobs."""
+        with self._lock:
+            return [
+                j for j in self._all_jobs.values()
+                if j.status == JobStatus.PAUSED
+            ]
+    
+    def get_completed_jobs(self, limit: int = 20) -> List[dict]:
+        """Get recently completed jobs."""
+        completed = [j for j in self._history if j.status == JobStatus.COMPLETED]
+        completed.sort(key=lambda j: j.completed_at or "", reverse=True)
+        return [j.to_dict() for j in completed[:limit]]
+    
+    def get_failed_jobs(self, limit: int = 20) -> List[dict]:
+        """Get recently failed jobs."""
+        failed = [j for j in self._history if j.status == JobStatus.FAILED]
+        failed.sort(key=lambda j: j.completed_at or "", reverse=True)
+        return [j.to_dict() for j in failed[:limit]]
+    
+    def get_all_job_statuses(self) -> List[dict]:
+        """Get status of all jobs (active + history)."""
+        with self._lock:
+            all_jobs = list(self._all_jobs.values()) + self._history[-50:]
+            return [j.to_dict() for j in all_jobs]
+    
+    def get_queue_summary(self) -> dict:
+        """Get summary of the entire queue."""
+        with self._lock:
+            return {
+                "active": len(self._active_jobs),
+                "max_concurrent": self.max_concurrent,
+                "queued": len(self.get_queued_jobs()),
+                "paused": len(self.get_paused_jobs()),
+                "completed": len([j for j in self._history if j.status == JobStatus.COMPLETED]),
+                "failed": len([j for j in self._history if j.status == JobStatus.FAILED]),
+                "cancelled": len([j for j in self._history if j.status == JobStatus.CANCELLED]),
+                "total_history": len(self._history),
+            }
+    
+    # ================================================================
+    # CALLBACKS
+    # ================================================================
+    
+    def on(self, event: str, callback: Callable):
+        """Register event callback."""
+        if event in self._callbacks:
+            self._callbacks[event].append(callback)
+    
+    def _fire(self, event: str, *args, **kwargs):
+        """Fire all callbacks for an event."""
+        for cb in self._callbacks.get(event, []):
+            try:
+                cb(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"Callback error [{event}]: {e}")
+    
+    # ================================================================
+    # HOUSEKEEPING
+    # ================================================================
+    
+    def _trim_history(self):
+        """Trim history to limit."""
+        while len(self._history) > self.history_limit:
+            self._history.pop(0)
+    
+    def clear_history(self):
+        """Clear all job history."""
+        with self._lock:
+            self._history.clear()
+            logger.info("Job history cleared")
+    
+    def clear_failed(self):
+        """Remove failed jobs from history."""
+        with self._lock:
+            self._history = [j for j in self._history if j.status != JobStatus.FAILED]
+            logger.info("Failed jobs cleared from history")
+
+
+# ============================================================
+# CONVENIENCE FUNCTIONS
+# ============================================================
+
+def create_default_manager(
+    state_dir: Optional[str] = None,
+    max_concurrent: int = 2,
+) -> TaskManager:
+    """
+    Create a TaskManager with sensible defaults.
+    
+    Args:
+        state_dir: Directory for state file (default: current dir)
+        max_concurrent: Max simultaneous renders
+    
+    Returns:
+        Configured TaskManager
+    """
+    state_dir = Path(state_dir or ".")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "task_manager_state.json"
+    
+    manager = TaskManager(
+        max_concurrent=max_concurrent,
+        state_file=str(state_file),
+        auto_retry=True,
+        max_retries=2,
+        history_limit=100,
+    )
+    
+    # Wire default callbacks
+    def on_job_started(job):
+        logger.info(f"[TASK] Started: {job.name}")
+    
+    def on_job_completed(job):
+        logger.info(f"[TASK] Completed: {job.name} | output={job.output_path}")
+    
+    def on_job_failed(job):
+        logger.error(f"[TASK] Failed: {job.name} | error={job.error_message}")
+    
+    def on_job_cancelled(job):
+        logger.info(f"[TASK] Cancelled: {job.name}")
+    
+    manager.on("job_started", on_job_started)
+    manager.on("job_completed", on_job_completed)
+    manager.on("job_failed", on_job_failed)
+    manager.on("job_cancelled", on_job_cancelled)
+    
+    return manager
+
+
+# ============================================================
+# SELF-TEST
+# ============================================================
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("TASK MANAGER — SELF-TEST")
+    print("=" * 60)
+    
+    manager = create_default_manager(max_concurrent=1)
+    
+    # Check state
+    summary = manager.get_queue_summary()
+    print(f"\n[1] Queue summary:")
+    for k, v in summary.items():
+        print(f"    {k}: {v}")
+    
+    # Add test jobs (mock — won't actually render)
+    print("\n[2] Adding test jobs...")
+    
+    # Mock config
+    class MockConfig:
+        clip_paths = ["test1.mp4", "test2.mp4", "test3.mp4"]
+        voice_path = "test_voice.wav"
+        output_path = "test_output.mp4"
+        niche = "default"
+        quality = "480p"
+        add_captions = True
+        music_path = None
+        sfx_paths = None
+        intro_path = None
+        outro_path = None
+        subscribe_overlay = None
+        custom_logo_path = None
+        batch_size = 8
+        fps = 24
+        caption_mode = "phrase"
+        caption_style_id = None
+        words_data = None
+        words_path = None
+        transcript_text = None
+        intro_seconds = 2.0
+        outro_seconds = 2.0
+        voice_start_offset = None
+        watermark_opacity = 0.6
+        enable_broll = False
+        temp_root = None
+        keep_temp = False
+        variation_enabled = True
+        use_transitions = True
+        preset_overrides = None
+        progress_callback = None
+        stage_callback = None
+    
+    job1 = manager.add_job(
+        config=MockConfig(),
+        name="Test Render — Luxury",
+        priority="high",
+    )
+    print(f"    Added: {job1}")
+    
+    job2 = manager.add_job(
+        config=MockConfig(),
+        name="Test Render — Finance",
+        priority="normal",
+    )
+    print(f"    Added: {job2}")
+    
+    # Cancel job2 since we can't actually render
+    manager.cancel_job(job2)
+    
+    # Updated summary
+    summary = manager.get_queue_summary()
+    print(f"\n[3] Updated summary:")
+    for k, v in summary.items():
+        print(f"    {k}: {v}")
+    
+    # Test pause/resume
+    paused = manager.pause_job(job1)
+    print(f"\n[4] Pause job1: {paused}")
+    
+    resumed = manager.resume_job(job1)
+    print(f"    Resume job1: {resumed}")
+    
+    # Cancel remaining
+    manager.cancel_job(job1)
+    
+    # History
+    history = manager.get_completed_jobs()
+    print(f"\n[5] History: {len(history)} jobs")
+    
+    failed = manager.get_failed_jobs()
+    print(f"    Failed: {len(failed)} jobs")
+    
+    print("\n[6] Test complete!")

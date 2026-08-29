@@ -1,0 +1,12 @@
+venv/
+inputs/
+outputs/
+assets/
+*.mp4
+*.mp3
+*.wav
+*.exe
+__pycache__/
+ImageMagick-7.1.2-Q16-HDRI/
+packages/
+*.whl

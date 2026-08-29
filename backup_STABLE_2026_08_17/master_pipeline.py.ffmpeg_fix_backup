@@ -1,0 +1,451 @@
+# -*- coding: utf-8 -*-
+import os
+import sys
+import glob
+import shutil
+import textwrap
+import multiprocessing
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+try:
+    from moviepy.editor import (
+        VideoFileClip, AudioFileClip, CompositeVideoClip, concatenate_videoclips,
+        CompositeAudioClip, ImageClip, afx
+    )
+    MOVIEPY_AVAILABLE = True
+except ImportError:
+    MOVIEPY_AVAILABLE = False
+    # MoviePy not available - FFmpeg will be used instead
+    class ImageSequenceClip:
+        def __init__(self, *args, **kwargs): pass
+    class CompositeVideoClip:
+        def __init__(self, *args, **kwargs): pass
+    class TextClip:
+        def __init__(self, *args, **kwargs): pass
+    class VideoFileClip:
+        def __init__(self, *args, **kwargs): pass
+
+# Detect maximum available CPU threads
+CPU_THREADS = max(1, multiprocessing.cpu_count())
+
+def hex_to_rgb(hex_str, default=(255, 255, 255)):
+    if not hex_str or not isinstance(hex_str, str):
+        return default
+    hex_str = str(hex_str).lstrip('#')
+    if len(hex_str) == 6:
+        try:
+            return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+        except Exception:
+            return default
+    return default
+
+def generate_subtitle_segments(audio_path, caption_type="phrase"):
+    """Generates subtitle segments using Whisper with word timestamps."""
+    segments = []
+    cap_type = str(caption_type).lower().replace(" ", "_")
+    
+    try:
+        import whisper
+        print(f"   ➔ Transcribing voice audio with Whisper [UI Mode: {caption_type}]...")
+        model = whisper.load_model("tiny") # Tiny model for maximum transcription speed
+        result = model.transcribe(audio_path, word_timestamps=True)
+
+        if "word" in cap_type:
+            for seg in result.get("segments", []):
+                for w in seg.get("words", []):
+                    w_text = w["word"].strip().upper()
+                    if w_text:
+                        segments.append({
+                            "start": float(w["start"]),
+                            "end": float(w["end"]),
+                            "text": w_text
+                        })
+        elif "line" in cap_type:
+            for seg in result.get("segments", []):
+                words = seg.get("words", [])
+                if not words:
+                    txt = seg["text"].strip().upper()
+                    if txt:
+                        segments.append({"start": float(seg["start"]), "end": float(seg["end"]), "text": txt})
+                    continue
+                
+                chunk_size = 5
+                for i in range(0, len(words), chunk_size):
+                    chunk = words[i:i+chunk_size]
+                    chunk_text = " ".join([w["word"].strip() for w in chunk]).upper()
+                    if chunk_text:
+                        segments.append({
+                            "start": float(chunk[0]["start"]),
+                            "end": float(chunk[-1]["end"]),
+                            "text": chunk_text
+                        })
+        else: # Phrase mode
+            for seg in result.get("segments", []):
+                txt = seg["text"].strip().upper()
+                if txt:
+                    segments.append({
+                        "start": float(seg["start"]),
+                        "end": float(seg["end"]),
+                        "text": txt
+                    })
+                
+        print(f"   [CAPTION ENGINE]: Generated {len(segments)} timed caption segments.")
+    except Exception as e:
+        print(f"   [WARN] Whisper transcription fallback: {e}")
+        audio_clip = AudioFileClip(audio_path)
+        dur = audio_clip.duration
+        audio_clip.close()
+        words = ["AUTOMATED VIDEO SYSTEM", "CREATORFLOW ENGINE V2", "AI CONTENT GENERATOR"]
+        step = dur / len(words)
+        for i, w in enumerate(words):
+            segments.append({"start": i * step, "end": (i + 1) * step, "text": w})
+            
+    return segments
+
+def draw_subtitles_on_frame(frame, current_time, subtitle_segments, video_size, style_config):
+    """Draws Subtitles optimized for 480p speed."""
+    active_text = ""
+    for seg in subtitle_segments:
+        if seg["start"] <= current_time <= seg["end"]:
+            active_text = seg["text"]
+            break
+
+    if not active_text:
+        return frame
+
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+    width, height = video_size
+
+    font_size_ratio = float(style_config.get("font_size_ratio", 0.045))
+    font_size = max(18, int(height * font_size_ratio))
+    text_color = style_config.get("text_color", (255, 235, 0))
+    stroke_color = style_config.get("stroke_color", (0, 0, 0))
+    bg_color = style_config.get("bg_color", (0, 0, 0, 190))
+    use_box = style_config.get("use_box", True)
+
+    font = None
+    font_paths = ["C:\\Windows\\Fonts\\arialbd.ttf", "C:\\Windows\\Fonts\\arial.ttf"]
+    for fp in font_paths:
+        if os.path.exists(fp):
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except Exception:
+                pass
+    if font is None:
+        font = ImageFont.load_default()
+
+    max_chars = max(10, int(width / (font_size * 0.55)))
+    wrapped_lines = textwrap.wrap(active_text, width=max_chars)
+
+    line_widths, line_heights = [], []
+    for line in wrapped_lines:
+        try:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_widths.append(bbox[2] - bbox[0])
+            line_heights.append(bbox[3] - bbox[1])
+        except Exception:
+            line_widths.append(len(line) * (font_size * 0.5))
+            line_heights.append(font_size)
+
+    max_line_w = max(line_widths) if line_widths else 80
+    line_h = max(line_heights) if line_heights else font_size
+    line_spacing = int(line_h * 0.2)
+    total_text_h = (line_h + line_spacing) * len(wrapped_lines) - line_spacing
+
+    start_y = height - total_text_h - int(height * 0.12)
+
+    padding = 10
+    if use_box and bg_color:
+        rect_x1 = (width - max_line_w) / 2 - padding
+        rect_y1 = start_y - padding
+        rect_x2 = (width + max_line_w) / 2 + padding
+        rect_y2 = start_y + total_text_h + padding
+        draw.rectangle([rect_x1, rect_y1, rect_x2, rect_y2], fill=bg_color)
+
+    current_y = start_y
+    for i, line in enumerate(wrapped_lines):
+        line_w = line_widths[i]
+        line_x = (width - line_w) / 2
+
+        stroke_w = 2
+        for ox in range(-stroke_w, stroke_w + 1):
+            for oy in range(-stroke_w, stroke_w + 1):
+                draw.text((line_x + ox, current_y + oy), line, font=font, fill=stroke_color)
+
+        draw.text((line_x, current_y), line, font=font, fill=text_color)
+        current_y += line_h + line_spacing
+
+    return np.array(img)
+
+def apply_green_screen_mask(cta_clip):
+    """Removes green screen background."""
+    try:
+        def make_mask(frame):
+            r = frame[:, :, 0].astype(float)
+            g = frame[:, :, 1].astype(float)
+            b = frame[:, :, 2].astype(float)
+            is_green = (g > 75) & (g > r * 1.15) & (g > b * 1.15)
+            mask = np.ones((frame.shape[0], frame.shape[1]), dtype=float)
+            mask[is_green] = 0.0
+            return mask
+
+        mask_clip = cta_clip.fl_image(make_mask)
+        return cta_clip.set_mask(mask_clip)
+    except Exception as e:
+        print(f"[WARN] Green screen chroma mask error: {e}")
+        return cta_clip
+
+def safe_load_clip_480p(clip_path, duration):
+    """Loads video clip and immediately resizes to 480p height for maximum render speed."""
+    if not os.path.exists(clip_path) or os.path.getsize(clip_path) < 1024:
+        return None
+    try:
+        vc = VideoFileClip(clip_path, audio=False)
+        _ = vc.get_frame(0)
+        
+        # Downscale clip immediately to 480p height (Ultra-Fast)
+        if vc.h > 480:
+            vc = vc.resize(height=480)
+            
+        if vc.duration < duration:
+            vc = vc.loop(duration=duration)
+        else:
+            vc = vc.subclip(0, duration)
+        return vc
+    except Exception:
+        return None
+
+def process_multi_clip_render(clips_list, audio_path, output_path, settings=None):
+    # --- FAIL-SAFE LONG VIDEO AUTOMATIC ROUTER ---
+    try:
+        import subprocess, json, batch_long_renderer
+        _probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(voice)], capture_output=True, text=True)
+        _dur = float(json.loads(_probe.stdout)['format']['duration'])
+        if _dur > 180.0:
+            print('\n======================================================================')
+            print(f'⚡ AUTO-DETECTED LONG VIDEO ({_dur:.1f}s > 180s)')
+            print('⚡ BYPASSING MOVIEPY 30,000 FRAMES -> ROUTING TO FFMPEG BATCH ENGINE')
+            print('======================================================================\n')
+            return batch_long_renderer.render_long_batch_memory(voice_path=voice, clips=clips, output_path=output_file if 'output_file' in locals() else 'final_renders/long_video.mp4')
+    except Exception as _e:
+        print(f'Auto-route check notice: {_e}')
+
+    print("\n======================================================================")
+    print(f"⚡ ULTRA-FAST 480P SPEED ENGINE - CPU THREADS: {CPU_THREADS}")
+    print(f"➔ Total Input Clips: {len(clips_list)}")
+    print("======================================================================\n")
+
+    if settings is None:
+        settings = {}
+
+    out_dir = os.path.dirname(output_path)
+    temp_chunks_dir = os.path.join(out_dir or ".", "temp_batch_chunks")
+    os.makedirs(temp_chunks_dir, exist_ok=True)
+
+    # 1. VOICE AUDIO
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Voice audio file missing: {audio_path}")
+
+    voice_audio = AudioFileClip(audio_path)
+    target_duration = voice_audio.duration
+    print(f"   ➔ Target Audio Duration: {target_duration:.2f}s")
+
+    try:
+        boosted_voice = voice_audio.volumex(1.25)
+        if target_duration > 0.5:
+            boosted_voice = boosted_voice.audio_fadeout(0.4)
+    except Exception:
+        boosted_voice = voice_audio
+
+    final_audio_tracks = [boosted_voice]
+
+    # 2. BACKGROUND MUSIC
+    bg_music_path = settings.get("bg_music_path") or settings.get("bg_music") or settings.get("music")
+    bg_volume = float(settings.get("bg_volume") or 0.15)
+
+    if bg_music_path and os.path.exists(str(bg_music_path)):
+        try:
+            bg_clip = AudioFileClip(str(bg_music_path))
+            if bg_clip.duration < target_duration:
+                loops = int(target_duration // bg_clip.duration) + 1
+                bg_clip = afx.audio_loop(bg_clip, nloops=loops)
+            bg_clip = bg_clip.subclip(0, target_duration).volumex(bg_volume)
+            final_audio_tracks.append(bg_clip)
+        except Exception:
+            pass
+
+    # 3. FAST BATCH PROCESSING (480P + ULTRAFAST PRESET)
+    valid_clips = [c for c in clips_list if os.path.exists(c)]
+    if not valid_clips:
+        raise FileNotFoundError("No valid video clips found on disk.")
+
+    num_clips = len(valid_clips)
+    clip_dur = target_duration / num_clips if num_clips > 0 else target_duration
+
+    chunk_size = 30 
+    batch_chunk_files = []
+    cut_timestamps = [0.0]
+    current_time = 0.0
+
+    for batch_idx in range(0, num_clips, chunk_size):
+        batch_paths = valid_clips[batch_idx : batch_idx + chunk_size]
+        loaded_batch_clips = []
+        
+        for idx, cp in enumerate(batch_paths):
+            vc = safe_load_clip_480p(cp, clip_dur)
+            if vc is not None:
+                loaded_batch_clips.append(vc)
+                current_time += clip_dur
+                if (batch_idx + idx) < num_clips - 1:
+                    cut_timestamps.append(round(current_time, 2))
+
+        if loaded_batch_clips:
+            batch_concat = concatenate_videoclips(loaded_batch_clips, method="compose")
+            chunk_file = os.path.join(temp_chunks_dir, f"chunk_{batch_idx}.mp4")
+            
+            # Export Chunk in Ultra-Fast mode
+            batch_concat.write_videofile(
+                chunk_file, 
+                fps=24, 
+                codec="libx264", 
+                audio=False, 
+                threads=CPU_THREADS, 
+                preset="ultrafast",
+                ffmpeg_params=["-crf", "28"],
+                verbose=False, 
+                logger=None
+            )
+            batch_chunk_files.append(chunk_file)
+            
+            batch_concat.close()
+            for c in loaded_batch_clips:
+                c.close()
+
+    if not batch_chunk_files:
+        raise RuntimeError("All video clips were corrupt or unreadable.")
+
+    # Combine pre-rendered 480p chunks
+    chunk_clips = [VideoFileClip(cf, audio=False) for cf in batch_chunk_files]
+    combined_video = concatenate_videoclips(chunk_clips, method="compose")
+    if combined_video.duration < target_duration:
+        combined_video = combined_video.loop(duration=target_duration)
+    combined_video = combined_video.subclip(0, target_duration)
+
+    # 4. SFX SYNCHRONIZATION
+    sfx_files = settings.get("sfx_files") or settings.get("sfx_list") or []
+    if isinstance(sfx_files, list) and len(sfx_files) > 0:
+        for i, cut_time in enumerate(cut_timestamps):
+            sfx_p = sfx_files[i % len(sfx_files)]
+            if os.path.exists(str(sfx_p)):
+                try:
+                    sfx_clip = AudioFileClip(str(sfx_p)).volumex(0.4)
+                    if sfx_clip.duration > 1.5:
+                        sfx_clip = sfx_clip.subclip(0, 1.5)
+                    sfx_clip = sfx_clip.set_start(cut_time)
+                    final_audio_tracks.append(sfx_clip)
+                except Exception:
+                    pass
+
+    final_audio = CompositeAudioClip(final_audio_tracks).set_duration(target_duration)
+    final_video = combined_video.set_audio(final_audio)
+
+    # 5. OVERLAYS (WATERMARK LOGO & SUBSCRIBE OVERLAY)
+    overlay_clips = [final_video]
+
+    logo_path = settings.get("logo_path") or settings.get("logo")
+    if logo_path and os.path.exists(str(logo_path)):
+        try:
+            logo_clip = (
+                ImageClip(str(logo_path))
+                .set_duration(target_duration)
+                .resize(width=100)
+                .set_position(("right", "top"))
+                .margin(right=15, top=15, opacity=0)
+            )
+            overlay_clips.append(logo_clip)
+        except Exception:
+            pass
+
+    cta_path = settings.get("cta_path") or settings.get("subscribe_overlay") or settings.get("cta")
+    if not cta_path or not os.path.exists(str(cta_path)):
+        possible_ctas = glob.glob("*subscribe*.mp4") + glob.glob("*cta*.mp4") + glob.glob("assets/*subscribe*.mp4")
+        if possible_ctas:
+            cta_path = possible_ctas[0]
+
+    if cta_path and os.path.exists(str(cta_path)):
+        try:
+            cta_start = target_duration * 0.15
+            cta_raw = VideoFileClip(str(cta_path), audio=False).resize(width=280)
+            if cta_raw.duration > (target_duration - cta_start):
+                cta_raw = cta_raw.subclip(0, target_duration - cta_start)
+            cta_clean = apply_green_screen_mask(cta_raw)
+            cta_clean = cta_clean.set_start(cta_start).set_position(("center", "bottom")).margin(bottom=30, opacity=0)
+            overlay_clips.append(cta_clean)
+        except Exception:
+            pass
+
+    master_composition = CompositeVideoClip(overlay_clips, size=final_video.size)
+
+    # 6. CAPTION CONFIG PARSING
+    enable_captions = settings.get("enable_captions", True)
+    
+    if enable_captions:
+        ui_cap_cfg = settings.get("caption_config") or {}
+        caption_type = ui_cap_cfg.get("caption_type", "phrase")
+        text_color_hex = ui_cap_cfg.get("text_color", "#FFE100")
+        bg_color_hex = ui_cap_cfg.get("bg_color", "#000000")
+        style_id = ui_cap_cfg.get("style_id", "boxed")
+
+        chosen_style = {
+            "text_color": hex_to_rgb(text_color_hex, (255, 225, 0)),
+            "stroke_color": (0, 0, 0),
+            "bg_color": (*hex_to_rgb(bg_color_hex, (0, 0, 0)), 190),
+            "use_box": True if "box" in str(style_id).lower() or ui_cap_cfg.get("use_box", True) else False,
+            "font_size_ratio": float(ui_cap_cfg.get("font_size_ratio", 0.045))
+        }
+
+        sub_segments = generate_subtitle_segments(audio_path, caption_type=caption_type)
+        v_w, v_h = master_composition.size
+        final_output_video = master_composition.fl(
+            lambda gf, t: draw_subtitles_on_frame(gf(t), t, sub_segments, (v_w, v_h), chosen_style)
+        )
+    else:
+        final_output_video = master_composition
+
+    # ULTRA-FAST FINAL EXPORT
+    print(f"\n[EXPORT] ENCODING 480P VIDEO AT MAXIMUM SPEED (THREADS: {CPU_THREADS})...")
+    final_output_video.write_videofile(
+        output_path,
+        fps=24,
+        codec="libx264",
+        audio_codec="aac",
+        threads=CPU_THREADS,
+        preset="ultrafast",
+        ffmpeg_params=["-crf", "28"]
+    )
+
+    try:
+        final_output_video.close()
+        master_composition.close()
+        final_video.close()
+        voice_audio.close()
+        for cc in chunk_clips:
+            cc.close()
+        shutil.rmtree(temp_chunks_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    print("======================================================================")
+    print(f"[SUCCESS] RENDER FINISHED IN RECORD TIME: {output_path}")
+    print("======================================================================\n")
+
+    return output_path

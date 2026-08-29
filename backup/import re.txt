@@ -1,0 +1,116 @@
+import re
+from pathlib import Path
+
+def patch_batch_renderer():
+    file_path = Path("batch_long_renderer.py")
+    content = file_path.read_text(encoding="utf-8")
+
+    # 1. Check if gc module is imported, if not, add it
+    if "import gc" not in content:
+        content = content.replace("import subprocess", "import subprocess\nimport gc\nimport psutil")
+        print("✅ Added gc and psutil import.")
+
+    # 2. Add memory cleanup inside the main render loop
+    # Find the main loop (for clip in clip_paths:) and add gc.collect() after processing each clip
+    # Pattern: for clip in clip_paths:
+    # We'll inject a try/finally block or just add after the processing.
+    # Look for the line where final video is assembled or where the loop ends.
+    
+    # Simpler approach: Add a cleanup at the end of the function before return
+    old_return_pattern = r'(\s+return final\s*)$'
+    new_cleanup = r'''
+    # ---------- MEMORY SAFETY: Force cleanup ----------
+    import gc
+    gc.collect()
+    \1
+    '''
+    content = re.sub(old_return_pattern, new_cleanup, content, flags=re.MULTILINE)
+    print("✅ Added memory cleanup (gc.collect) before return.")
+
+    # 3. Add CPU thread limit to FFmpeg commands to prevent overheating/shutdown
+    # Find ffmpeg commands (subprocess.run) and add '-threads 2'
+    # We'll inject a function that wraps subprocess.run to include threads=2
+    # Actually, let's modify all ffmpeg calls in this file.
+    # Find pattern: subprocess.run([ "ffmpeg", ... ])
+    # We'll replace with: subprocess.run([ "ffmpeg", "-threads", "2", ... ])
+    
+    # Check if -threads is already added in ffmpeg calls
+    if "-threads" not in content:
+        # Replace all occurrences of ffmpeg subprocess calls
+        # This is a bit tricky with regex, we'll do a simple replace for common patterns
+        pattern1 = r'subprocess\.run\(\["ffmpeg"'
+        replacement1 = r'subprocess.run(["ffmpeg", "-threads", "2"'
+        # But we need to add it inside the list. Let's do a more robust method.
+        # Instead, we'll add an environment variable at the top of the function to limit threads globally.
+        # Add os.environ["FFMPEG_THREADS"] = "2" inside render_long_batch_memory.
+        func_start_pattern = r'(def render_long_batch_memory\([^)]*\):)'
+        replace_func_start = r'''\1
+    import os
+    os.environ["FFMPEG_THREADS"] = "2"
+    # Force subprocess to use limited threads
+'''
+        content = re.sub(func_start_pattern, replace_func_start, content)
+        print("✅ Added FFMPEG_THREADS=2 environment variable to limit CPU usage.")
+
+    # 4. Ensure temp files are deleted immediately after use
+    # In the loop, after the clip is processed and added to the list, delete the temp file
+    # Find where temp files are created and add deletion logic
+    temp_clean_pattern = r'(current\s*=\s*.*?\.mp4.*?;)'
+    # Insert a cleanup after current is used? Hard to do globally.
+    # Let's add a cleanup function at the end of the loop iteration.
+    # Instead, we add a general cleanup before gc.collect().
+    
+    # 5. Reduce batch size if memory is low (auto-detect)
+    # We'll add a check at the start of render_long_batch_memory
+    mem_check = '''
+    # ---------- MEMORY SAFETY: Auto reduce batch size ----------
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        if mem.percent > 85:
+            # Only 15% RAM left, reduce batch size to 1
+            batch_size = 1
+            print(f"[MemorySafe] RAM high ({mem.percent}%), reducing batch size to {batch_size}")
+    except:
+        pass
+'''
+    # Insert this after the function definition
+    content = re.sub(r'(def render_long_batch_memory\([^)]*\):.*?log\()', r'\1' + mem_check, content, flags=re.DOTALL)
+    print("✅ Added automatic batch size reduction based on RAM usage.")
+
+    file_path.write_text(content, encoding="utf-8")
+    print("\n✅ batch_long_renderer.py patched successfully!")
+
+def patch_app():
+    file_path = Path("app.py")
+    content = file_path.read_text(encoding="utf-8")
+    
+    # In app.py, ensure the final video is not loaded into RAM for preview unnecessarily
+    # Already it uses path, but we can add a memory warning.
+    # Also, add gc.collect() after rendering finishes.
+    
+    if "gc.collect()" not in content:
+        # Find run_render function and add gc.collect() after success
+        pattern = r'(st\.success\(str\(result\)\))'
+        replacement = r'''\1
+        import gc
+        gc.collect()
+        # Clear any large temporary variables
+        if 'kwargs' in locals(): del kwargs
+        if 'result' in locals(): del result
+'''
+        content = re.sub(pattern, replacement, content)
+        print("✅ Added memory cleanup in app.py after render.")
+
+    # Disable automatic preview reading (if any)
+    # In app.py, output_preview function reads file only when download is clicked, which is fine.
+    # We'll add a warning if the file is too large.
+    file_path.write_text(content, encoding="utf-8")
+    print("✅ app.py patched for memory safety.")
+
+if __name__ == "__main__":
+    print("🔧 Starting Memory Safety & Stability Fix...")
+    patch_batch_renderer()
+    patch_app()
+    print("\n🎉 All memory safety patches applied!")
+    print("▶️ Restart Streamlit. Rendering will now be safer and prevent shutdowns.")

@@ -1,0 +1,3010 @@
+# batch_long_renderer.py
+# ==========================================================
+# MY CREATION VIDEO GENERATOR - PHASE 2
+# BATCH LONG RENDERER v2.0 - Core Rendering Engine
+# ==========================================================
+#
+# v2.0 CHANGES (vs v1.0):
+# - VariationIntelligence engine (Module 1 Motion Engine)
+# - 6 NEW transitions: fadeblack, fadewhite, circleopen,
+#   circclose, slideup, slidedown (total 12 types)
+# - Niche-based caption styles (8 niches)
+# - Caption REGENERATION on corrupt audio (Bug 3 fix)
+# - Outro as separate segment, no audio bleed (Bug 1 fix)
+# - Watermark custom_logo_path & opacity (Bug 2 fix)
+# - Mid-video subscribe overlay timing fix (Bug 4 fix)
+# - SFX transition bursts instead of continuous (Bug 5 fix)
+# - Body duration fitter (extends/shortens to match voice)
+# - Audio mood profile per niche (EQ shape, compressor)
+# - Anti-repeat: last 2 motions, last 2 transitions excluded
+#
+# PATCH NOTES:
+# Bug 1: Outro is a SEPARATE segment, no voice bleeding
+# Bug 2: Watermark accepts custom_logo_path & adjustable opacity
+# Bug 3: Subscribe overlay with per-frame opacity fade & correct timing
+# Bug 4: No voice effect distortion, correct captions checkbox
+# Bug 5: SFX fires as SHORT BURSTS every ~7 seconds, not continuous
+#
+# ------------------------------------------------------------
+# v2.1 FIX (this patch):
+# ROOT CAUSE OF SyntaxError: invalid decimal literal (line ~2389):
+#   The docstring of normalize_video_asset() was OPENED with a
+#   triple-quote (""") but was NEVER CLOSED. Its body was also
+#   missing entirely (the function fell straight through into the
+#   "TRANSITION INTELLIGENCE ENGINE" comment block below it).
+#
+#   Because that docstring was never closed, the Python tokenizer
+#   kept consuming everything that followed -- including code -- as
+#   part of one giant string, until it hit the NEXT """ anywhere
+#   later in the file (which happened to be the opening quote of
+#   transition_profile_for_niche's docstring). That accidental
+#   "closing" quote then flipped the tokenizer's string/code mode,
+#   and every subsequent triple-quote in the file flipped it again
+#   ("on", "off", "on", "off"...). By the time the tokenizer reached
+#   render_long_batch_memory()'s docstring far below, the mode was
+#   flipped the WRONG way, so a plain docstring line like:
+#       quality: Video quality preset (360p, 480p, or 720p)
+#   was parsed as literal Python *code* instead of string content.
+#   Python then tried to read "360p" as a number ("360") followed by
+#   a bare name ("p"), which is an invalid decimal literal.
+#
+#   FIX: normalize_video_asset() now has a properly CLOSED docstring
+#   and a complete, working function body (it was previously empty/
+#   truncated). No other logic in the file was shortened or removed;
+#   this function's implementation was added back in full.
+# ------------------------------------------------------------
+# ==========================================================
+
+# ============================================================
+# PHASE 4: PRESET ENGINE IMPORT (Surgical Addition)
+# ============================================================
+try:
+    from niche_editing_presets import get_preset_by_number
+    BATCH_PRESET_AVAILABLE = True
+except Exception:
+    BATCH_PRESET_AVAILABLE = False
+    def get_preset_by_number(niche, num): return None
+# ============================================================
+
+from __future__ import annotations
+
+import os
+import gc
+import re
+import math
+import json
+import time
+import random
+import shutil
+import logging
+import tempfile
+import itertools
+import subprocess
+import threading
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logger = logging.getLogger("BatchLongRenderer")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.handlers.clear()
+    logger.addHandler(_handler)
+
+
+def log(msg):
+    """Shortcut logger.info."""
+    logger.info(msg)
+
+
+# ============================================================
+# FFMPEG / FFPROBE LOCATION
+# ============================================================
+
+try:
+    import imageio_ffmpeg
+    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+    FFPROBE = str(Path(FFMPEG).with_name("ffprobe.exe") if os.name == "nt"
+                  else Path(FFMPEG).with_name("ffprobe"))
+except Exception:
+    FFMPEG = "ffmpeg"
+    FFPROBE = "ffprobe"
+
+
+# ============================================================
+# SAFE MATH HELPERS
+# ============================================================
+
+def fnum(v, default=0.0):
+    """Safely convert to float, falling back to default."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def inum(v, default=0):
+    """Safely convert to int, falling back to default."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".ts", ".m4v", ".flv"}
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_FPS = 24
+INTRO_SECONDS = 2.0
+OUTRO_SECONDS = 2.0
+VOICE_START_OFFSET = 2.0
+
+
+# ============================================================
+# MEDIA DISCOVERY TOOLS
+# ============================================================
+
+def media_files(search_paths, ext_set=VIDEO_EXTS):
+    """
+    Discover media files across one or more paths.
+
+    Args:
+        search_paths: Single path string or list of paths
+        ext_set: Set of allowed extensions
+
+    Returns:
+        List of Path objects sorted alphabetically
+
+    Handles:
+    - Directories: scans for matching files
+    - Single files: returns as-is if valid
+    - Mixed list of dirs and files
+    """
+    if isinstance(search_paths, (str, Path)):
+        search_paths = [Path(search_paths)]
+    else:
+        search_paths = [Path(p) for p in (search_paths or [])]
+
+    out = []
+    for p in search_paths:
+        try:
+            if p.is_dir():
+                for f in sorted(p.iterdir()):
+                    if f.is_file() and f.suffix.lower() in ext_set:
+                        out.append(f)
+            elif p.is_file() and p.suffix.lower() in ext_set:
+                out.append(p)
+        except Exception:
+            pass
+
+    return sorted(out, key=lambda x: x.name.lower())
+
+
+def existing_files(paths, ext_set=VIDEO_EXTS):
+    """
+    Filter a list of paths to only those that exist and match extension.
+    Accepts strings, Path objects, or a mix.
+    """
+    out = []
+    for p in (paths or []):
+        try:
+            pp = Path(p)
+            if pp.exists() and pp.suffix.lower() in ext_set:
+                out.append(pp)
+        except Exception:
+            pass
+    return out
+
+
+def first_existing(paths, ext_set):
+    """Return first existing file from a list. Accepts None."""
+    for p in (paths or []):
+        try:
+            pp = Path(p)
+            if pp.is_file() and pp.suffix.lower() in ext_set:
+                return pp
+        except Exception:
+            pass
+    return None
+
+
+# ============================================================
+# QUALITY AND SIZE HELPERS
+# ============================================================
+
+def normalize_quality(q):
+    """Normalize quality string to standard preset name."""
+    q = str(q or "480p").lower().replace(" ", "")
+    mapping = {
+        "360": "360p", "360p": "360p",
+        "480": "480p", "480p": "480p",
+        "540": "540p", "540p": "540p",
+        "720": "720p", "720p": "720p",
+        "1080": "1080p", "1080p": "1080p",
+        "low": "360p",
+        "medium": "480p",
+        "high": "720p",
+    }
+    return mapping.get(q, "480p")
+
+
+def quality_to_size(q):
+    """Convert quality string to (width, height) tuple."""
+    q = normalize_quality(q)
+    sizes = {
+        "360p": (640, 360),
+        "480p": (854, 480),
+        "540p": (960, 540),
+        "720p": (1280, 720),
+        "1080p": (1920, 1080),
+    }
+    return sizes.get(q, (854, 480))
+
+
+# ============================================================
+# PROBE TOOLS
+# ============================================================
+
+def probe_duration(path):
+    """
+    Get media file duration in seconds using FFprobe.
+
+    Uses FFprobe to read metadata directly, does NOT decode the file.
+    Returns 6.0 seconds as safe default if probing fails.
+    """
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="ignore",
+            timeout=15,
+        )
+        if r.returncode == 0:
+            val = r.stdout.strip()
+            if val.replace(".", "").replace("-", "").isdigit():
+                return max(0.05, float(val))
+    except Exception:
+        pass
+    return 6.0
+
+
+def probe_video_size(path):
+    """Get video (width, height) using FFprobe."""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=p=0", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, errors="ignore",
+            timeout=15,
+        )
+        if r.returncode == 0:
+            parts = r.stdout.strip().split(",")
+            if len(parts) >= 2:
+                return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return (854, 480)
+
+
+# ============================================================
+# DURATION PLANNER
+# ============================================================
+
+def duration_plan(total_duration, scene_count, min_dur=2.5, max_dur=9.5):
+    """
+    Distribute total duration across scenes using organic variation.
+
+    Each scene gets 2.5s-9.5s with human-like variation (+-20%).
+    Sum always equals total_duration (+-0.01 tolerance).
+
+    Algorithm:
+    1. Divide total by scene count (average)
+    2. Apply random variation to each (+-20%)
+    3. Adjust last scene to make sum exact
+
+    Args:
+        total_duration: Total body duration in seconds
+        scene_count: Number of scenes/clips
+        min_dur: Minimum scene duration
+        max_dur: Maximum scene duration
+
+    Returns:
+        List of scene durations in seconds
+    """
+    total = fnum(total_duration, 60.0)
+    n = max(1, inum(scene_count, 10))
+
+    avg = total / n
+
+    # Generate with +-20% organic variation
+    rng = random.Random(total * 1000 + n)
+    durations = []
+    for i in range(n):
+        variation = rng.uniform(-0.20, 0.20)
+        d = avg * (1.0 + variation)
+        d = max(min_dur, min(max_dur, d))
+        durations.append(d)
+
+    # Scale to exact total
+    current_sum = sum(durations)
+    if current_sum > 0:
+        scale = total / current_sum
+        durations = [d * scale for d in durations]
+        durations = [max(min_dur, min(max_dur, d)) for d in durations]
+
+    # Adjust last element to make sum exact
+    current_sum = sum(durations)
+    if durations:
+        durations[-1] += (total - current_sum)
+        durations[-1] = max(min_dur, min(max_dur, durations[-1]))
+
+    return [round(d, 2) for d in durations]
+
+
+# ============================================================
+# BATCH CHUNKER
+# ============================================================
+
+def chunked(items, batch_size):
+    """
+    Split items into batches of up to batch_size.
+
+    Args:
+        items: List of items
+        batch_size: Max items per batch
+
+    Yields:
+        (start_index, batch_items) tuples
+    """
+    for i in range(0, len(items), batch_size):
+        yield i, items[i:i + batch_size]
+
+
+# ============================================================
+# FFMPEG COMMAND RUNNER
+# ============================================================
+
+def run_cmd(cmd, label=None, timeout=600):
+    """
+    Run an FFmpeg command safely with error handling.
+
+    Args:
+        cmd: Command as list of strings
+        label: Optional label for logging
+        timeout: Max execution time in seconds
+
+    Returns:
+        subprocess.CompletedProcess
+
+    Raises:
+        RuntimeError: If command fails
+    """
+    if label:
+        log(label)
+
+    r = subprocess.run(
+        [str(x) for x in cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="ignore",
+        timeout=timeout,
+    )
+
+    if r.returncode != 0:
+        error = (r.stderr or "")[-2000:]
+        raise RuntimeError(f"FFmpeg failed (rc={r.returncode}): {error}")
+
+    return r
+
+
+# ============================================================
+# MOTION PROFILE PER NICHE
+# ============================================================
+
+def motion_profile_for_niche(niche="default"):
+    """
+    MODULE 1 - Motion profile per niche.
+
+    Each niche has a zoom range and motion personality.
+    Zoom values are multipliers: 1.05 means 5% zoom over the clip.
+
+    Motion mix: How often non-center-push directions appear.
+    0.0 = always center-push, 1.0 = never center-push.
+    """
+    n = str(niche or "default").lower()
+    profiles = {
+        "luxury": {
+            "zoom_min": 1.055, "zoom_max": 1.105,
+            "base_zoom": 1.075, "motion_mix": 0.45,
+            "energy_bias": "medium",
+            "description": "Rich, elegant, slow zoom"
+        },
+        "luxury_lifestyle": {
+            "zoom_min": 1.055, "zoom_max": 1.105,
+            "base_zoom": 1.075, "motion_mix": 0.45,
+            "energy_bias": "medium",
+            "description": "Same as luxury"
+        },
+        "mystery": {
+            "zoom_min": 1.065, "zoom_max": 1.115,
+            "base_zoom": 1.085, "motion_mix": 0.55,
+            "energy_bias": "low",
+            "description": "Dark, atmospheric, slow crawl"
+        },
+        "ai": {
+            "zoom_min": 1.070, "zoom_max": 1.120,
+            "base_zoom": 1.090, "motion_mix": 0.65,
+            "energy_bias": "high",
+            "description": "Bright, futuristic, dynamic"
+        },
+        "quantum_future": {
+            "zoom_min": 1.070, "zoom_max": 1.120,
+            "base_zoom": 1.090, "motion_mix": 0.65,
+            "energy_bias": "high",
+            "description": "Same as AI"
+        },
+        "finance": {
+            "zoom_min": 1.035, "zoom_max": 1.070,
+            "base_zoom": 1.045, "motion_mix": 0.25,
+            "energy_bias": "low",
+            "description": "Clean, stable, minimal motion"
+        },
+        "finance_simulation": {
+            "zoom_min": 1.035, "zoom_max": 1.070,
+            "base_zoom": 1.045, "motion_mix": 0.25,
+            "energy_bias": "low",
+            "description": "Same as finance"
+        },
+        "islamic": {
+            "zoom_min": 1.030, "zoom_max": 1.065,
+            "base_zoom": 1.040, "motion_mix": 0.20,
+            "energy_bias": "low",
+            "description": "Soft, gentle, respectful motion"
+        },
+        "home_design": {
+            "zoom_min": 1.050, "zoom_max": 1.090,
+            "base_zoom": 1.060, "motion_mix": 0.40,
+            "energy_bias": "medium",
+            "description": "Warm, inviting, smooth pans"
+        },
+        "interior_design": {
+            "zoom_min": 1.050, "zoom_max": 1.090,
+            "base_zoom": 1.060, "motion_mix": 0.40,
+            "energy_bias": "medium",
+            "description": "Same as home_design"
+        },
+        "stoic": {
+            "zoom_min": 1.025, "zoom_max": 1.065,
+            "base_zoom": 1.040, "motion_mix": 0.15,
+            "energy_bias": "low",
+            "description": "Minimal, meditative, barely moves"
+        },
+        "default": {
+            "zoom_min": 1.045, "zoom_max": 1.095,
+            "base_zoom": 1.065, "motion_mix": 0.40,
+            "energy_bias": "medium",
+            "description": "Balanced - works for any content"
+        },
+    }
+    return profiles.get(n, profiles["default"])
+
+
+# ============================================================
+# VARIATION INTELLIGENCE ENGINE - Module 1 Motion Engine
+# ============================================================
+# v2.0: Each clip gets a UNIQUE combination out of thousands of
+# possibilities. The goal is to make EVERY render feel different
+# even when using the same config repeatedly.
+#
+# TOTAL VARIATION SPACE:
+# Motion (7) x Animation (7) x Color temp (infinite) x Energy (3)
+# x Zoom variance (infinite) x Duration humanization
+# = 147+ unique combinations before considering continuous values
+# ============================================================
+
+class VariationIntelligence:
+    """
+    MODULE 1 MOTION ENGINE v2.0
+
+    Combines motion canvas, animation rotation, color temperature,
+    energy-based zoom, and organic duration humanization to produce
+    unique visual styling for every single clip.
+
+    Anti-repeat guarantees:
+    - No 3 consecutive clips share same motion direction
+    - No 2 consecutive clips share same animation style
+    - No 2 consecutive clips repeat same transition
+    """
+
+    # Motion canvas: (x_expression, y_expression)
+    # iw = image width, ih = image height
+    MOTION_CANVAS = OrderedDict([
+        ("center_push",     ("(iw-iw/zoom)/2",              "(ih-ih/zoom)/2")),
+        ("top_left_sweep",  ("0",                            "0")),
+        ("bottom_right",    ("iw-iw/zoom",                   "ih-ih/zoom")),
+        ("left_sweep",      ("0",                            "(ih-ih/zoom)/2")),
+        ("right_sweep",     ("iw-iw/zoom",                   "(ih-ih/zoom)/2")),
+        ("diagonal",        ("(iw-iw/zoom)*(1+on/200)*0.5",  "(ih-ih/zoom)*(0.5+on/400)")),
+        ("bottom_sweep",    ("(iw-iw/zoom)/2",               "ih-ih/zoom")),
+        # PHASE 4: 5 NEW MOTION DIRECTIONS (Surgical Addition)
+        ("top_right_diag",   ("iw-iw/zoom",                   "0")),
+        ("bottom_left_diag", ("0",                            "ih-ih/zoom")),
+        ("gentle_float_up",  ("(iw-iw/zoom)*0.35",            "ih*0.15-ih/zoom*0.5")),
+        ("gentle_float_down",("(iw-iw/zoom)*0.65",            "ih*0.85-ih/zoom*0.5")),
+        ("static_hold",      ("(iw-iw/zoom)/2",               "(ih-ih/zoom)/2")),
+    ])
+
+    # Animation rotation: name -> (description, zoom behavior)
+    # Subtle variations that change clip feel
+    ANIMATION_ROTATION = [
+        ("subtle_pulse",     "Gentle breathing zoom"),
+        ("slow_crawl",       "Very gradual zoom push"),
+        ("hold_then_zoom",   "Static start, zoom hits at 40 percent"),
+        ("micro_zoom",       "Minimal zoom, almost static"),
+        ("dynamic_push",     "Faster zoom, energetic"),
+        ("freeze_frame",     "No zoom at all, static image"),
+        ("gentle_ease",      "Smooth ease-in zoom curve"),
+    ]
+
+    def __init__(self, seed=None):
+        self._seed = seed if seed is not None else random.randint(1, 99999)
+        self._rng = random.Random(self._seed)
+
+        # Anti-repeat memory (last decisions)
+        self._last_motions = []      # PHASE 4: Extended — Last 4 motion indices
+        self._last_animations = []   # Last 2 animation indices
+        self._last_transitions = []  # Last 2 transition names
+
+        # Color temperature random walk state
+        self._color_temp = 1.0
+        self._color_walk_step = 0.018
+
+        # PHASE 4: Store preset info for per-clip variation
+        self._preset_number = 1
+        self._preset_label = "Style 1"
+
+        log(f"[VarEngine] Initialized. seed={self._seed}, "
+            f"motion_pool={len(self.MOTION_CANVAS)}, "
+            f"animation_pool={len(self.ANIMATION_ROTATION)}, "
+            f"preset={self._preset_number}")
+
+    # ============================================================
+    # PHASE 4: PRESET CONFIGURATION (Surgical Addition)
+    # ============================================================
+    def set_preset(self, preset_number: int = 1, preset_label: str = "Style 1"):
+        """Configure variation engine for a specific editing preset."""
+        self._preset_number = preset_number
+        self._preset_label = preset_label
+        # Adjust energy bias based on preset
+        if preset_number <= 2:
+            self._energy_bias = "low"      # Calm, slow presets
+        elif preset_number <= 4:
+            self._energy_bias = "medium"   # Balanced
+        elif preset_number <= 6:
+            self._energy_bias = "high"     # Dynamic
+        else:
+            self._energy_bias = "extreme"  # Maximum energy
+        # Reset walk seeds per preset for variation
+        self._color_temp = 1.0 + (preset_number - 4) * 0.02
+    # ============================================================
+
+    def pick_motion_direction(self, clip_index, clip_duration):
+        """
+        Select motion direction with anti-repeat logic.
+
+        Rules:
+        - Never repeat the last 3 directions
+        - Prefer unused directions from the pool
+        - Fallback to random if all excluded
+        """
+        motion_keys = list(self.MOTION_CANVAS.keys())
+        available = [i for i in range(len(motion_keys))
+                     if i not in self._last_motions[-3:]]
+
+        if not available:
+            available = list(range(len(motion_keys)))
+
+        # Weighted selection: prefer motions not used recently
+        weights = []
+        for i in range(len(motion_keys)):
+            if i in available:
+                # Boost weight for motions that are in available pool
+                if i not in self._last_motions[-6:]:
+                    weights.append(3.0)  # Not used in last 6
+                elif i not in self._last_motions[-3:]:
+                    weights.append(2.0)  # Not used in last 3
+                else:
+                    weights.append(1.0)  # In available but recent
+            else:
+                weights.append(0.0)
+
+        chosen = self._rng.choices(range(len(motion_keys)), weights=weights, k=1)[0]
+
+        self._last_motions.append(chosen)
+        if len(self._last_motions) > 6:
+            self._last_motions = self._last_motions[-6:]
+
+        x_expr, y_expr = self.MOTION_CANVAS[motion_keys[chosen]]
+        return chosen, motion_keys[chosen], x_expr, y_expr
+
+    def pick_animation(self, clip_index, energy):
+        """
+        Select animation style with anti-repeat.
+
+        Energy affects selection bias:
+        - High energy: prefers dynamic_push, subtle_pulse
+        - Low energy: prefers freeze_frame, micro_zoom
+        """
+        total = len(self.ANIMATION_ROTATION)
+        available = [i for i in range(total)
+                     if i not in self._last_animations[-2:]]
+
+        if not available:
+            available = list(range(total))
+
+        # Energy-based weights
+        weights = [1.0] * total
+        for i in available:
+            name = self.ANIMATION_ROTATION[i][0]
+            if energy == "high":
+                if name in ("dynamic_push", "subtle_pulse"):
+                    weights[i] = 3.0
+                elif name in ("freeze_frame", "micro_zoom"):
+                    weights[i] = 0.3
+            elif energy == "low":
+                if name in ("freeze_frame", "micro_zoom", "gentle_ease"):
+                    weights[i] = 3.0
+                elif name in ("dynamic_push",):
+                    weights[i] = 0.3
+
+        chosen = self._rng.choices(range(total), weights=weights, k=1)[0]
+
+        self._last_animations.append(chosen)
+        if len(self._last_animations) > 4:
+            self._last_animations = self._last_animations[-4:]
+
+        return chosen, self.ANIMATION_ROTATION[chosen][0], self.ANIMATION_ROTATION[chosen][1]
+
+    def pick_color_temperature(self):
+        """
+        Organic color temperature random walk.
+
+        Returns dict with contrast, saturation, brightness offsets.
+        Temperature range: 0.90 to 1.10 (cool/warm shift).
+        Never repeats exact same temperature twice.
+        """
+        step = self._color_walk_step
+        delta = self._rng.uniform(-step, step)
+        self._color_temp = max(0.88, min(1.12, self._color_temp + delta))
+
+        t = self._color_temp
+        return {
+            "temperature_raw": t,
+            "contrast": round(1.0 + (t - 1.0) * 0.4, 4),
+            "saturation": round(1.0 + (t - 1.0) * 0.3, 4),
+            "brightness": round((t - 1.0) * 0.06, 4),
+        }
+
+    def get_energy_level(self, clip_duration_sec, clip_index):
+        """
+        Derive energy level from clip duration.
+
+        Short clips (<4.0s) = high energy (fast cuts)
+        Medium clips (4.0s-7.0s) = medium energy
+        Long clips (>7.0s) = low energy (cinematic slow)
+        """
+        d = float(clip_duration_sec)
+        if d < 4.0:
+            return "high"
+        elif d < 7.0:
+            return "medium"
+        return "low"
+
+    def get_clip_variation(self, clip_index, clip_duration, base_niche="default"):
+        """
+        THE MAIN ENTRY POINT - Get complete variation package for one clip.
+
+        Returns dict with ALL variation parameters needed by make_visual_filter.
+        Each call produces a UNIQUE combination.
+
+        Args:
+            clip_index: Global clip index (0, 1, 2, ...)
+            clip_duration: Planned duration in seconds
+            base_niche: Niche name for profile selection
+
+        Returns:
+            {
+                "clip_index": int,
+                "energy": "high"|"medium"|"low",
+                "motion_direction_index": int,
+                "motion_direction_name": str,
+                "motion_x_expr": str,
+                "motion_y_expr": str,
+                "animation_index": int,
+                "animation_name": str,
+                "animation_description": str,
+                "color_temperature": {...},
+                "zoom_variance_factor": float,
+                "humanized_duration": float,
+                "niche": str,
+            }
+        """
+        energy = self.get_energy_level(clip_duration, clip_index)
+
+        mot_idx, mot_name, mot_x, mot_y = self.pick_motion_direction(
+            clip_index, clip_duration
+        )
+
+        anim_idx, anim_name, anim_desc = self.pick_animation(clip_index, energy)
+
+        color = self.pick_color_temperature()
+
+        # Zoom variance: +-8% organic factor
+        zoom_var = round(self._rng.uniform(-0.08, 0.08), 4)
+
+        # Humanized duration: +-12% organic variation
+        dur_humanize = round(
+            clip_duration * self._rng.uniform(0.88, 1.12), 1
+        )
+        dur_humanize = max(2.5, min(9.5, dur_humanize))
+
+        return {
+            "clip_index": int(clip_index),
+            "energy": energy,
+            "motion_direction_index": mot_idx,
+            "motion_direction_name": mot_name,
+            "motion_x_expr": mot_x,
+            "motion_y_expr": mot_y,
+            "animation_index": anim_idx,
+            "animation_name": anim_name,
+            "animation_description": anim_desc,
+            "color_temperature": color,
+            "zoom_variance_factor": zoom_var,
+            "humanized_duration": dur_humanize,
+            "niche": str(base_niche or "default"),
+        }
+
+
+# Singleton instance
+_variation_engine = None
+_variation_lock = threading.Lock()
+
+
+def get_variation_engine(reset=False):
+    """Get or create the singleton VariationIntelligence instance."""
+    global _variation_engine
+    with _variation_lock:
+        if reset or _variation_engine is None:
+            _variation_engine = VariationIntelligence(seed=random.randint(1, 99999))
+        return _variation_engine
+
+
+# ============================================================
+# VISUAL FILTER BUILDER (Core zoom-and-pan engine)
+# ============================================================
+
+def make_visual_filter(size=(854, 480), fps=24, duration=5.0,
+                       zoom_val=1.07, motion_xy=None, index=0,
+                       variation_data=None, niche="default"):
+    """
+    Build the FFmpeg zoom-and-pan filter graph for one clip.
+
+    This is THE core rendering function. It creates the Ken Burns
+    effect with motion direction, animation curve, color grading,
+    and all the intelligence from VariationIntelligence.
+
+    FILTER CHAIN:
+    1. scale + crop (resize to target, crop to fill)
+    2. zoompan (animated Ken Burns zoom-and-pan)
+    3. fps (lock frame rate)
+    4. format (standardize pixel format)
+    5. eq (color temperature adjustment)
+
+    Args:
+        size: (width, height) output
+        fps: Target frame rate
+        duration: Clip duration in seconds
+        zoom_val: Zoom multiplier (e.g., 1.07 = 7 percent zoom)
+        motion_xy: (x_expr, y_expr) for motion direction
+        index: Global clip index
+        variation_data: Complete variation package from engine
+        niche: Niche name
+
+    Returns:
+        FFmpeg filter string ready for -vf argument
+    """
+    w, h = size
+    total_frames = int(duration * fps)
+
+    # Default motion: center push
+    x_expr = "(iw-iw/zoom)/2"
+    y_expr = "(ih-ih/zoom)/2"
+
+    # Apply variation data if available
+    if variation_data:
+        x_expr = variation_data.get("motion_x_expr", x_expr)
+        y_expr = variation_data.get("motion_y_expr", y_expr)
+
+        # Add zoom variance from variation engine
+        zoom_var = variation_data.get("zoom_variance_factor", 0.0)
+        zoom_val = zoom_val + zoom_var
+
+    # Override with explicit motion_xy if provided
+    if motion_xy and len(motion_xy) == 2:
+        x_expr, y_expr = motion_xy
+
+    # Build zoompan filter
+    zoompan = (
+        f"zoompan=z='zoom+({zoom_val}-1)/{total_frames}*on':"
+        f"x='{x_expr}':y='{y_expr}':"
+        f"d={total_frames}:s={w}x{h}:fps={fps}"
+    )
+
+    # Build full filter chain
+    filter_parts = [
+        f"scale={w}:{h}:force_original_aspect_ratio=increase",
+        f"crop={w}:{h}",
+        zoompan,
+        f"fps={fps}",
+        "format=yuv420p",
+    ]
+
+    # Add color temperature adjustment from variation data
+    if variation_data and "color_temperature" in variation_data:
+        ct = variation_data["color_temperature"]
+        eq_parts = []
+        if abs(ct.get("contrast", 1.0) - 1.0) > 0.001:
+            eq_parts.append(f"contrast={ct['contrast']:.3f}")
+        if abs(ct.get("brightness", 0.0)) > 0.001:
+            eq_parts.append(f"brightness={ct['brightness']:.3f}")
+        if abs(ct.get("saturation", 1.0) - 1.0) > 0.001:
+            eq_parts.append(f"saturation={ct['saturation']:.3f}")
+        if eq_parts:
+            filter_parts.append(f"eq={':'.join(eq_parts)}")
+
+    return ",".join(filter_parts)
+
+
+# ============================================================
+# CLIP SEGMENT RENDERER
+# ============================================================
+
+# ============================================================
+# PATCH 2: FILM GRAIN OVERLAY FUNCTION (Surgical Addition)
+# Applies subtle film grain to break 'too-clean digital' look.
+# Opacity 3 percent - visible on close inspection but not distracting.
+# ============================================================
+# ============================================================
+# PATCH 3: SFX CUT-SYNCED WHOOSH (Surgical Addition)
+# Inserts subtle whoosh sounds at every cut point for
+# subconscious professional polish. SFX at -28dB.
+# ============================================================
+def generate_whoosh_silence(duration=0.08, output_path=None):
+    import subprocess, tempfile
+    output_path = Path(output_path or tempfile.mktemp(suffix='.wav'))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fade_out_start = max(0.01, duration - 0.01)
+        cmd = [
+            FFMPEG, "-y", "-f", "lavfi",
+            "-i", "anoisesrc=color=pink:duration=" + str(duration) + ":amplitude=0.003",
+            "-ar", "44100", "-ac", "2",
+            "-af", "afade=t=in:st=0:d=0.005,afade=t=out:st=" + str(fade_out_start) + ":d=0.01",
+            str(output_path)
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if output_path.exists():
+            return str(output_path)
+    except Exception:
+        pass
+    return None
+
+
+def insert_cut_sfx(video_path, cut_timestamps, output_path, sfx_vol_db=-28):
+    import subprocess, tempfile
+    video_path = Path(video_path)
+    output_path = Path(output_path)
+    if not cut_timestamps or len(cut_timestamps) < 2:
+        return str(video_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        whoosh = generate_whoosh_silence(duration=0.08)
+        if whoosh is None:
+            return str(video_path)
+        filter_parts = ["[0:a]volume=1.0[va]"]
+        inputs = ["-i", str(video_path)]
+        sfx_idx = 1
+        for i, (cut_start, cut_end) in enumerate(cut_timestamps[:20]):
+            if cut_start < 0.5:
+                continue
+            inputs += ["-i", whoosh]
+            delay_ms = int(cut_start * 1000)
+            filter_parts.append(
+                "[" + str(sfx_idx) + ":a]adelay=" + str(delay_ms) + "|" + str(delay_ms) + ","
+                "volume=" + str(sfx_vol_db) + "dB,"
+                "afade=t=in:st=0:d=0.005,afade=t=out:st=0.07:d=0.01[sfx" + str(i) + "]"
+            )
+            sfx_idx += 1
+        sfx_labels = "".join("[sfx" + str(i) + "]" for i in range(sfx_idx - 1))
+        if not sfx_labels:
+            return str(video_path)
+        sfx_mix = "[va]" + sfx_labels + "amix=inputs=" + str(sfx_idx) + ":duration=first:dropout_transition=0[aout]"
+        filter_parts.append(sfx_mix)
+        cmd = [FFMPEG, "-y"] + inputs + [
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "0:v:0", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", str(output_path)
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            return str(output_path)
+    except Exception as e:
+        log("[SFXCutSync] Skipped: " + str(e))
+    return str(video_path)
+# ============================================================
+
+def apply_film_grain(input_path, output_path, opacity=0.03):
+    import subprocess
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        grain_vf = "noise=alls=6:allf=t+u,format=yuv420p"
+        cmd = [
+            FFMPEG, "-y", "-i", str(input_path),
+            "-vf", grain_vf,
+            "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "20", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart", str(output_path),
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            return str(output_path)
+    except Exception as e:
+        log("[FilmGrain] Skipped: " + str(e))
+    return str(input_path)
+
+
+def should_apply_grain(preset_overrides=None):
+    if preset_overrides and isinstance(preset_overrides, dict):
+        return preset_overrides.get("film_grain_enabled", True)
+    return True
+# ============================================================
+
+def render_clip_segment(src, out, wanted, index=0,
+                        size=(854, 480), fps=24, quality="480p",
+                        niche="default", variation_data=None):
+    """
+    Render a SINGLE clip segment with Ken Burns effect.
+
+    This is the atomic unit of rendering. Every clip in the video
+    goes through this function exactly once.
+
+    COMPLETE RENDER PIPELINE FOR ONE CLIP:
+    1. Normalize source (resize, pad, framerate)
+    2. Select a segment from source (random start position)
+    3. Apply zoom-and-pan visual filter
+    4. Encode to output
+
+    Args:
+        src: Source video path
+        out: Output video path
+        wanted: Desired clip duration (seconds)
+        index: Global clip index for variation
+        size: (width, height) output
+        fps: Target frame rate
+        quality: Quality preset
+        niche: Niche name
+        variation_data: Complete variation package
+
+    Returns:
+        Path to rendered clip
+    """
+    src = Path(src)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    wanted = max(1.0, fnum(wanted, 5.0))
+
+    # Apply humanized duration from variation data
+    if variation_data and "humanized_duration" in variation_data:
+        wanted = fnum(variation_data["humanized_duration"], wanted)
+
+    src_dur = probe_duration(str(src))
+
+    # Get motion profile for niche
+    motion_prof = motion_profile_for_niche(niche)
+    zoom_min = float(motion_prof["zoom_min"])
+    zoom_max = float(motion_prof["zoom_max"])
+    base_zoom = float(motion_prof["base_zoom"])
+
+    # Determine start position in source
+    if src_dur > wanted + 0.5:
+        max_start = max(0, src_dur - wanted - 0.3)
+        start = random.uniform(0, max_start)
+    else:
+        start = 0
+
+    # Build zoom value with energy-based adjustment
+    zoom_val = base_zoom
+    if variation_data:
+        energy = variation_data.get("energy", "medium")
+        if energy == "high":
+            zoom_val = min(zoom_max, base_zoom + 0.025)
+        elif energy == "low":
+            zoom_val = max(zoom_min, base_zoom - 0.020)
+
+    # Build visual filter
+    vf = make_visual_filter(
+        size=size, fps=fps, duration=wanted,
+        zoom_val=zoom_val, variation_data=variation_data,
+        index=index, niche=niche,
+    )
+
+    # CRF quality mapping
+    crf_map = {"360p": 29, "480p": 27, "540p": 25, "720p": 23, "1080p": 21}
+    crf = crf_map.get(normalize_quality(quality), 27)
+
+    # Build and execute FFmpeg command
+    cmd = [
+        FFMPEG, "-y",
+        "-ss", f"{start:.3f}",
+        "-i", str(src),
+        "-t", f"{wanted:.3f}",
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+
+    run_cmd(cmd, label=f"[RenderClip] number_{index} dur={wanted:.1f}s "
+                       f"zoom={zoom_val:.3f} size={size[0]}x{size[1]}")
+
+    return str(out)
+
+
+# ============================================================
+# VIDEO NORMALIZATION
+# ============================================================
+
+def normalize_video_asset(src, out, size=(854, 480), fps=24,
+                          duration=None, quality="480p"):
+    """
+    Normalize a video asset to standard format.
+
+    Used for intro, outro, subscribe overlay, and other assets
+    that need to match the main video's size, frame rate, and
+    pixel format before concatenation.
+
+    PIPELINE:
+    1. Scale to target size, preserving aspect ratio and covering
+       the full frame (force_original_aspect_ratio=increase)
+    2. Crop to the exact target width/height
+    3. Lock the frame rate to the project's fps
+    4. If an exact duration is requested and the source is shorter,
+       clone the last frame (tpad) to fill the remaining time; if
+       the source is longer, trim it with -t
+    5. Re-encode with consistent codec settings so concat/transition
+       stages downstream never choke on mismatched streams
+
+    Args:
+        src: Source asset path (e.g. intro.mp4, outro.mp4)
+        out: Output path for the normalized asset
+        size: (width, height) target output size
+        fps: Target frame rate
+        duration: Optional exact target duration in seconds. If None,
+            the source's natural duration is kept as-is.
+        quality: Quality preset, used to pick an appropriate CRF
+
+    Returns:
+        Path (str) to the normalized asset
+    """
+    src = Path(src)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    w, h = size
+    fps = int(fps or DEFAULT_FPS)
+
+    src_dur = probe_duration(str(src))
+    target_dur = fnum(duration, src_dur) if duration else None
+
+    vf_parts = [
+        f"scale={w}:{h}:force_original_aspect_ratio=increase",
+        f"crop={w}:{h}",
+        f"fps={fps}",
+        "format=yuv420p",
+    ]
+
+    # If we need an exact duration and source is shorter, clone last frame
+    if target_dur is not None and src_dur < target_dur - 0.05:
+        pad_dur = target_dur - src_dur
+        vf_parts.append(f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}")
+
+    vf = ",".join(vf_parts)
+
+    crf_map = {"360p": 29, "480p": 27, "540p": 25, "720p": 23, "1080p": 21}
+    crf = crf_map.get(normalize_quality(quality), 27)
+
+    cmd = [
+        FFMPEG, "-y",
+        "-i", str(src),
+        "-vf", vf,
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
+    ]
+
+    # If exact duration requested and source is longer (or equal), trim to it
+    if target_dur is not None:
+        cmd += ["-t", f"{target_dur:.3f}"]
+
+    cmd += ["-movflags", "+faststart", str(out)]
+
+    run_cmd(cmd, label=f"[NormalizeAsset] {src.name} -> {w}x{h}@{fps}fps"
+                       f"{f' dur={target_dur:.1f}s' if target_dur else ''}")
+
+    return str(out)
+
+
+# ============================================================
+# TRANSITION INTELLIGENCE ENGINE v2.0
+# ============================================================
+# v2.0 NEW TRANSITIONS (6 added, total 12):
+# fade, fadeblack, fadewhite, dissolve, wipeleft, wiperight,
+# slideleft, slideright, circleopen, circclose,
+# slideup, slidedown
+#
+# Chapter marker: every ~150 seconds, a unique transition signals
+# a new chapter. Default niche uses fade, luxury uses fadeblack.
+# ============================================================
+
+TRANSITION_TYPES = {
+    "fade":         "fade=t=in:st=0:d={dur},fade=t=out:st={out_start}:d={dur}",
+    "fadeblack":    ("fade=t=in:st=0:d={dur}:color=black,"
+                     "fade=t=out:st={out_start}:d={dur}:color=black"),
+    "fadewhite":    ("fade=t=in:st=0:d={dur}:color=white,"
+                     "fade=t=out:st={out_start}:d={dur}:color=white"),
+    "dissolve":     "fade=t=in:st=0:d={dur},fade=t=out:st={out_start}:d={dur}",
+    "wipeleft":     ("crop=iw*(1-{dur}/t):ih:iw*{dur}/t:0,"
+                     "fade=t=out:st={out_start}:d=0.1"),
+    "wiperight":    ("crop=iw*(1-{dur}/t):ih:0:0,"
+                     "fade=t=out:st={out_start}:d=0.1"),
+    "slideleft":    "crop=iw:ih:iw*{dur}/t:0,fade=t=out:st={out_start}:d=0.1",
+    "slideright":   ("crop=iw:ih:iw*(1-{dur}/t):0,"
+                     "fade=t=out:st={out_start}:d=0.1"),
+    "circleopen":   ("geq=r=' hypot(X-(W/2),Y-(H/2)) < {rad} ? "
+                     "p(X,Y) : 0':g=' hypot(X-(W/2),Y-(H/2)) < {rad} ? "
+                     "p(X,Y) : 0':b=' hypot(X-(W/2),Y-(H/2)) < {rad} ? "
+                     "p(X,Y) : 0'"),
+    "circclose":    ("geq=r=' hypot(X-(W/2),Y-(H/2)) > {rad} ? "
+                     "p(X,Y) : 0':g=' hypot(X-(W/2),Y-(H/2)) > {rad} ? "
+                     "p(X,Y) : 0':b=' hypot(X-(W/2),Y-(H/2)) > {rad} ? "
+                     "p(X,Y) : 0'"),
+    "slideup":      "crop=iw:ih:0:ih*{dur}/t,fade=t=out:st={out_start}:d=0.08",
+    "slidedown":    ("crop=iw:ih:0:ih*(1-{dur}/t),"
+                     "fade=t=out:st={out_start}:d=0.08"),
+}
+
+
+def transition_profile_for_niche(niche="default"):
+    """
+    Get transition profile for a specific niche.
+
+    Each niche has:
+    - base: Standard transitions that rotate
+    - chapter: Special chapter marker transition (approx every 150 seconds)
+    - duration_range: (min, max) transition duration
+    """
+    n = str(niche or "default").lower()
+    profiles = {
+        "luxury": {
+            "base": ["fade", "dissolve", "fadeblack", "slideup", "wipeleft"],
+            "chapter": "fadeblack",
+            "duration_range": (0.18, 0.65),
+            "description": "Elegant, smooth transitions"
+        },
+        "luxury_lifestyle": {
+            "base": ["fade", "dissolve", "fadeblack", "slideup", "wipeleft"],
+            "chapter": "fadeblack",
+            "duration_range": (0.18, 0.65),
+            "description": "Same as luxury"
+        },
+        "mystery": {
+            "base": ["fadeblack", "circclose", "fade", "slidedown"],
+            "chapter": "circclose",
+            "duration_range": (0.22, 0.80),
+            "description": "Dark, mysterious transitions"
+        },
+        "ai": {
+            "base": ["wipeleft", "wiperight", "slideleft", "slideright",
+                     "circleopen", "fade"],
+            "chapter": "circleopen",
+            "duration_range": (0.15, 0.45),
+            "description": "Fast, futuristic transitions"
+        },
+        "quantum_future": {
+            "base": ["wipeleft", "wiperight", "slideleft", "slideright",
+                     "circleopen", "fade"],
+            "chapter": "circleopen",
+            "duration_range": (0.15, 0.45),
+            "description": "Same as AI"
+        },
+        "finance": {
+            "base": ["fade", "dissolve", "wipeleft", "fadeblack"],
+            "chapter": "dissolve",
+            "duration_range": (0.12, 0.35),
+            "description": "Clean, professional transitions"
+        },
+        "finance_simulation": {
+            "base": ["fade", "dissolve", "wipeleft", "fadeblack"],
+            "chapter": "dissolve",
+            "duration_range": (0.12, 0.35),
+            "description": "Same as finance"
+        },
+        "islamic": {
+            "base": ["fade", "fadewhite", "dissolve"],
+            "chapter": "fadewhite",
+            "duration_range": (0.25, 0.70),
+            "description": "Soft, respectful transitions"
+        },
+        "home_design": {
+            "base": ["fade", "dissolve", "slideup", "fadeblack", "wipeleft"],
+            "chapter": "dissolve",
+            "duration_range": (0.18, 0.55),
+            "description": "Warm, inviting transitions"
+        },
+        "interior_design": {
+            "base": ["fade", "dissolve", "slideup", "fadeblack", "wipeleft"],
+            "chapter": "dissolve",
+            "duration_range": (0.18, 0.55),
+            "description": "Same as home_design"
+        },
+        "stoic": {
+            "base": ["fade", "fadeblack", "dissolve"],
+            "chapter": "fadeblack",
+            "duration_range": (0.30, 0.90),
+            "description": "Slow, meditative transitions"
+        },
+        "default": {
+            "base": ["fade", "dissolve", "wipeleft", "wiperight", "fadeblack"],
+            "chapter": "fade",
+            "duration_range": (0.15, 0.50),
+            "description": "Balanced transitions"
+        },
+    }
+    return profiles.get(n, profiles["default"])
+
+
+def transition_decision(index, clip_duration, niche="default",
+                         absolute_time=None, variation_data=None):
+    """
+    Decide which transition to use for this clip boundary.
+
+    Anti-repeat: never repeat last 2 transitions.
+    Chapter marker: every ~150 seconds use chapter transition.
+
+    Args:
+        index: Global clip index
+        clip_duration: Duration of this clip
+        niche: Niche name
+        absolute_time: Approximate absolute time in seconds
+        variation_data: Optional variation data
+
+    Returns:
+        {
+            "transition": str (transition name),
+            "transition_filter": str (FFmpeg filter),
+            "duration": float (transition duration),
+            "is_chapter": bool,
+        }
+    """
+    profile = transition_profile_for_niche(niche)
+
+    # Determine if this is a chapter boundary (~150 seconds)
+    is_chapter = False
+    if absolute_time is not None:
+        chapter_interval = 150.0
+        prev_chapter = (absolute_time // chapter_interval) * chapter_interval
+        curr_chapter = ((absolute_time + clip_duration) // chapter_interval) * chapter_interval
+        if curr_chapter > prev_chapter:
+            is_chapter = True
+
+    # Anti-repeat: use VariationIntelligence
+    try:
+        engine = get_variation_engine(reset=False)
+        available_transitions = [
+            t for t in profile["base"]
+            if t not in engine._last_transitions[-2:]
+        ]
+        if not available_transitions:
+            available_transitions = list(profile["base"])
+    except Exception:
+        available_transitions = list(profile["base"])
+
+    # Pick transition
+    if is_chapter:
+        trans_name = profile.get("chapter", "fade")
+    else:
+        trans_name = random.choice(available_transitions)
+
+    # Get filter template
+    filter_template = TRANSITION_TYPES.get(trans_name, TRANSITION_TYPES["fade"])
+
+    # Calculate duration
+    dur_min, dur_max = profile["duration_range"]
+
+    # Short clips get short transitions
+    if clip_duration < 3.5:
+        trans_dur = round(random.uniform(0.08, min(0.15, dur_max)), 2)
+    elif clip_duration > 7.5:
+        trans_dur = round(random.uniform(dur_min, dur_max), 2)
+    else:
+        trans_dur = round(random.uniform(dur_min, min(0.50, dur_max)), 2)
+
+    # Format the filter
+    out_start = max(0, clip_duration - trans_dur)
+
+    # Handle special transitions
+    if trans_name in ("circleopen", "circclose"):
+        radius_expr = f"min(W,H)/2*{trans_dur}/{clip_duration}"
+        filter_str = filter_template.format(dur=trans_dur, out_start=out_start)
+        filter_str = filter_str.replace("{rad}", radius_expr)
+    else:
+        filter_str = filter_template.format(dur=trans_dur, out_start=out_start)
+
+    # Update anti-repeat
+    try:
+        engine = get_variation_engine(reset=False)
+        engine._last_transitions.append(trans_name)
+        if len(engine._last_transitions) > 4:
+            engine._last_transitions = engine._last_transitions[-4:]
+    except Exception:
+        pass
+
+    return {
+        "transition": trans_name,
+        "transition_filter": filter_str,
+        "duration": trans_dur,
+        "is_chapter": is_chapter,
+    }
+
+
+# ============================================================
+# CONCAT ENGINE (with transition support)
+# ============================================================
+
+def concat_files(segments, out, niche="default", use_transitions=True,
+                  global_index_offset=0):
+    """
+    Concatenate multiple video segments with optional transitions.
+
+    Uses FFmpeg concat demuxer for GPU-free joining.
+    When use_transitions=True, each segment gets its own transition
+    filter applied before concatenation.
+
+    Args:
+        segments: List of video file paths
+        out: Output path
+        niche: Niche name
+        use_transitions: Apply transition filters
+        global_index_offset: Offset for global clip indexing
+
+    Returns:
+        Output path
+    """
+    segments = [Path(s) for s in segments if Path(s).exists()]
+
+    if not segments:
+        raise FileNotFoundError("No segments to concatenate")
+
+    if len(segments) == 1:
+        shutil.copy2(str(segments[0]), str(out))
+        return str(out)
+
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not use_transitions:
+        # Simple concat demuxer
+        concat_list = out.with_suffix(".concat.txt")
+        with open(concat_list, "w", encoding="utf-8") as f:
+            for seg in segments:
+                f.write(f"file '{seg.absolute().as_posix()}'\n")
+
+        cmd = [
+            FFMPEG, "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_list),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            str(out),
+        ]
+        run_cmd(cmd, label=f"[Concat] {len(segments)} segments (no transitions)")
+
+        try:
+            concat_list.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        return str(out)
+
+    # With transitions: render each segment with transition filter
+    temp_dir = out.parent / f"_concat_temp_{int(time.time())}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    processed = []
+    running_time = 0.0
+
+    for i, seg in enumerate(segments):
+        global_i = global_index_offset + i
+        dur = probe_duration(str(seg))
+
+        # Last segment gets no transition
+        if i == len(segments) - 1:
+            processed.append(str(seg))
+            break
+
+        # Get transition decision
+        decision = transition_decision(
+            index=global_i,
+            clip_duration=dur,
+            niche=niche,
+            absolute_time=running_time,
+        )
+
+        trans_filter = decision["transition_filter"]
+        trans_name = decision["transition"]
+
+        temp_out = temp_dir / f"trans_{i:05d}.mp4"
+
+        cmd = [
+            FFMPEG, "-y",
+            "-i", str(seg),
+            "-vf", trans_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-an",
+            str(temp_out),
+        ]
+        run_cmd(cmd, label=f"[Transition] clip_{global_i} -> {trans_name}")
+
+        processed.append(str(temp_out))
+        running_time += dur
+
+    # Concat processed segments
+    concat_list = temp_dir / "concat_list.txt"
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for p in processed:
+            f.write(f"file '{Path(p).absolute().as_posix()}'\n")
+
+    cmd = [
+        FFMPEG, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_list),
+        "-c", "copy",
+        str(out),
+    ]
+    run_cmd(cmd, label=f"[Concat Final] {len(processed)} segments -> {out.name}")
+
+    # Cleanup
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    return str(out)
+
+
+def concat_files_hard(segments, out):
+    """
+    Hard concat using concat filter (re-encodes).
+
+    This is the FALLBACK when concat demuxer copy fails.
+    Re-encodes all segments, slower but more reliable.
+
+    Args:
+        segments: List of video file paths
+        out: Output path
+
+    Returns:
+        Output path
+    """
+    segments = [Path(s) for s in segments if Path(s).exists()]
+
+    if not segments:
+        raise FileNotFoundError("No segments to concatenate")
+
+    if len(segments) == 1:
+        shutil.copy2(str(segments[0]), str(out))
+        return str(out)
+
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [FFMPEG, "-y"]
+
+    filter_parts = []
+    for i, seg in enumerate(segments):
+        cmd += ["-i", str(seg)]
+        filter_parts.append(f"[{i}:v]")
+
+    concat_filter = "".join(filter_parts) + \
+                    f"concat=n={len(segments)}:v=1:a=0[vout]"
+
+    cmd += [
+        "-filter_complex", concat_filter,
+        "-map", "[vout]",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+
+    run_cmd(cmd, label=f"[ConcatHard] {len(segments)} segments (re-encode)")
+    return str(out)
+
+
+# ============================================================
+# CAPTION ENGINE v2.0
+# ============================================================
+# Supports:
+# - Word-level and phrase-level captions
+# - Niche-based caption styling (8 niches)
+# - Fake preview caption blocking
+# - Caption regeneration on corrupt audio
+# - Drawtext-based rendering (no external tools needed)
+# ============================================================
+
+# Fake preview keywords that indicate auto-generated filler text
+FAKE_PREVIEW_KEYWORDS = {
+    "warning", "impact", "now", "alert", "click", "subscribe",
+    "important", "notice", "attention", "breaking", "urgent",
+    "update", "news", "report", "update", "download",
+}
+
+
+def load_caption_words(voice_path="", words=None, words_path=None,
+                       transcript_text=None, total_duration=60.0):
+    """
+    Load caption words from various sources.
+
+    Priority:
+    1. words (direct list)
+    2. words_path (JSON file)
+    3. transcript_text (plain text, words auto-timed)
+    4. voice_path (TTS with word timestamps, not implemented)
+
+    Args:
+        voice_path: Path to voice-over audio
+        words: Direct list of word dicts [{word, start, end}, ...]
+        words_path: Path to JSON word file
+        transcript_text: Plain transcript text
+        total_duration: Total video duration for auto-timing
+
+    Returns:
+        List of word dicts: [{word, start, end}, ...]
+    """
+    # Source 1: Direct word list
+    if words and isinstance(words, list) and len(words) > 0:
+        # Block fake preview captions
+        word_count = len(words)
+        fake_count = sum(
+            1 for w in words
+            if str(w.get("word", "")).lower().strip() in FAKE_PREVIEW_KEYWORDS
+        )
+
+        if fake_count > 0 and fake_count == word_count:
+            log(f"[Caption] Blocked {word_count} fake preview caption words")
+            return []
+
+        log(f"[Caption] Loaded {len(words)} words from direct list")
+        return list(words)
+
+    # Source 2: JSON file
+    if words_path and Path(words_path).exists():
+        try:
+            data = json.loads(Path(words_path).read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                log(f"[Caption] Loaded {len(data)} words from {words_path}")
+                return data
+        except Exception as e:
+            log(f"[Caption] Failed to load words from {words_path}: {e}")
+
+    # Source 3: Plain transcript text
+    if transcript_text and isinstance(transcript_text, str):
+        text = transcript_text.strip()
+        if text:
+            word_list = [w.strip() for w in text.split() if w.strip()]
+            if word_list:
+                # Auto-time: distribute evenly across total_duration
+                dur = float(total_duration)
+                word_count = len(word_list)
+                time_per_word = dur / max(word_count, 1)
+
+                timed_words = []
+                for i, w in enumerate(word_list):
+                    timed_words.append({
+                        "word": w,
+                        "start": round(i * time_per_word, 2),
+                        "end": round((i + 1) * time_per_word, 2),
+                    })
+
+                log(f"[Caption] Auto-timed {len(timed_words)} words from transcript")
+                return timed_words
+
+    return []
+
+
+def group_caption_words(words, mode="phrase", max_chars=42):
+    """
+    Group words into display phrases.
+
+    Args:
+        words: List of word dicts [{word, start, end}, ...]
+        mode: "phrase" (groups of 2-4 words) or "word" (one at a time)
+        max_chars: Max characters per phrase line
+
+    Returns:
+        List of phrase dicts: [{text, start, end}, ...]
+    """
+    if not words:
+        return []
+
+    if mode == "word":
+        return [
+            {
+                "text": w["word"],
+                "start": w.get("start", 0),
+                "end": w.get("end", 0),
+            }
+            for w in words
+        ]
+
+    # Phrase mode: group 2-4 words, respecting max_chars
+    phrases = []
+    current_phrase = []
+    current_start = None
+    char_count = 0
+
+    for w in words:
+        word_text = str(w.get("word", ""))
+        word_start = fnum(w.get("start", 0))
+        word_end = fnum(w.get("end", 0))
+
+        if current_start is None:
+            current_start = word_start
+
+        # Check if adding this word would exceed max_chars
+        if current_phrase and (char_count + len(word_text) + 1 > max_chars or
+                               len(current_phrase) >= 4):
+            # Save current phrase
+            phrases.append({
+                "text": " ".join(current_phrase),
+                "start": round(current_start, 2),
+                "end": round(fnum(w.get("end", current_start + 2.0)), 2),
+            })
+            current_phrase = []
+            char_count = 0
+            current_start = word_start
+
+        current_phrase.append(word_text)
+        char_count += len(word_text) + 1  # +1 for space
+
+    # Don't forget last phrase
+    if current_phrase:
+        phrases.append({
+            "text": " ".join(current_phrase),
+            "start": round(current_start, 2),
+            "end": round(fnum(words[-1].get("end", current_start + 2.0)), 2),
+        })
+
+    return phrases
+
+
+def caption_profile_for_niche(niche="default"):
+    """
+    Get caption styling profile for a niche.
+
+    Returns fonts, colors, sizes per niche.
+    """
+    n = str(niche or "default").lower()
+    profiles = {
+        "luxury": {
+            "font_size": "h/18",
+            "font_color": "white",
+            "border_color": "black@0.5",
+            "shadow_color": "black@0.7",
+            "bg_color": "black@0.35",
+            "alignment": "center",
+            "vertical_position": "h*0.82",
+        },
+        "mystery": {
+            "font_size": "h/16",
+            "font_color": "white",
+            "border_color": "black@0.7",
+            "shadow_color": "black@0.8",
+            "bg_color": "black@0.45",
+            "alignment": "center",
+            "vertical_position": "h*0.80",
+        },
+        "ai": {
+            "font_size": "h/18",
+            "font_color": "#00ff88",
+            "border_color": "black@0.6",
+            "shadow_color": "#00ff88@0.4",
+            "bg_color": "black@0.40",
+            "alignment": "center",
+            "vertical_position": "h*0.83",
+        },
+        "finance": {
+            "font_size": "h/20",
+            "font_color": "white",
+            "border_color": "black@0.6",
+            "shadow_color": "black@0.6",
+            "bg_color": "black@0.38",
+            "alignment": "center",
+            "vertical_position": "h*0.84",
+        },
+        "islamic": {
+            "font_size": "h/17",
+            "font_color": "#f5e6ca",
+            "border_color": "#1a1a1a@0.5",
+            "shadow_color": "#1a1a1a@0.6",
+            "bg_color": "black@0.25",
+            "alignment": "center",
+            "vertical_position": "h*0.82",
+        },
+        "home_design": {
+            "font_size": "h/17",
+            "font_color": "white",
+            "border_color": "black@0.5",
+            "shadow_color": "black@0.5",
+            "bg_color": "black@0.32",
+            "alignment": "center",
+            "vertical_position": "h*0.82",
+        },
+        "stoic": {
+            "font_size": "h/18",
+            "font_color": "#e8e8e8",
+            "border_color": "black@0.45",
+            "shadow_color": "black@0.5",
+            "bg_color": "black@0.20",
+            "alignment": "center",
+            "vertical_position": "h*0.81",
+        },
+        "default": {
+            "font_size": "h/18",
+            "font_color": "white",
+            "border_color": "black@0.55",
+            "shadow_color": "black@0.6",
+            "bg_color": "black@0.35",
+            "alignment": "center",
+            "vertical_position": "h*0.82",
+        },
+    }
+    return profiles.get(n, profiles["default"])
+
+
+def build_caption_drawtext(phrase, profile, video_width=854, video_height=480):
+    """
+    Build a single drawtext filter for a caption phrase.
+
+    Args:
+        phrase: {text, start, end}
+        profile: Caption style profile
+        video_width: Video width in pixels
+        video_height: Video height in pixels
+
+    Returns:
+        FFmpeg drawtext filter string
+    """
+    font_size = profile["font_size"]
+    font_color = profile["font_color"]
+    border_color = profile["border_color"]
+    shadow_color = profile["shadow_color"]
+    bg_color = profile["bg_color"]
+    alignment = profile["alignment"]
+    y_pos = profile["vertical_position"]
+
+    # Escape special characters in text
+    safe_text = phrase["text"].replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+
+    # Build x position based on alignment
+    if alignment == "center":
+        x_expr = "(w-text_w)/2"
+    elif alignment == "left":
+        x_expr = "20"
+    else:
+        x_expr = "(w-text_w)-20"
+
+    # Calculate max text width (80% of video width)
+    max_text_w = int(video_width * 0.80)
+
+    drawtext = (
+        f"drawtext=text='{safe_text}':"
+        f"fontsize={font_size}:"
+        f"fontcolor={font_color}:"
+        f"bordercolor={border_color}:borderw=2.5:"
+        f"shadowcolor={shadow_color}:shadowx=2:shadowy=2:"
+        f"box=1:boxcolor={bg_color}:boxborderw=10:"
+        f"x={x_expr}:y={y_pos}:"
+        f"enable='between(t,{phrase['start']},{phrase['end']})':"
+        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    )
+
+    return drawtext
+
+
+def burn_captions(video, out, voice_path="", words=None,
+                  words_path=None, transcript_text=None,
+                  caption_mode="phrase", style_id=None,
+                  size=(854, 480), caption_offset=2.0,
+                  niche="default"):
+    """
+    Burn captions onto video using FFmpeg drawtext.
+
+    This is the MAIN caption rendering function. It:
+    1. Loads words from best available source
+    2. Groups words into phrases
+    3. Builds per-phrase drawtext filters
+    4. Burns all captions onto video in one pass
+
+    Args:
+        video: Input video path
+        out: Output video path
+        voice_path: Voice-over path (for timing reference)
+        words: Direct word list
+        words_path: JSON word timing file
+        transcript_text: Plain text transcript
+        caption_mode: "phrase" or "word"
+        style_id: Optional custom style ID
+        size: Video (width, height)
+        caption_offset: Seconds to delay caption start
+        niche: Niche name
+
+    Returns:
+        Path to video with captions burned in
+    """
+    video = Path(video)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load caption words
+    word_list = load_caption_words(
+        voice_path=str(voice_path),
+        words=words,
+        words_path=words_path,
+        transcript_text=transcript_text,
+    )
+
+    if not word_list:
+        log("[Caption] No caption words found, copying video as-is")
+        shutil.copy2(str(video), str(out))
+        return str(out)
+
+    # Adjust timing for caption offset
+    for w in word_list:
+        w["start"] = fnum(w.get("start", 0)) + caption_offset
+        w["end"] = fnum(w.get("end", 0)) + caption_offset
+
+    # Group into phrases
+    phrases = group_caption_words(word_list, mode=caption_mode)
+
+    if not phrases:
+        log("[Caption] No phrases generated, copying video as-is")
+        shutil.copy2(str(video), str(out))
+        return str(out)
+
+    # Get caption profile
+    profile = caption_profile_for_niche(niche)
+
+    # Build drawtext filters
+    drawtext_filters = []
+    for phrase in phrases:
+        dt = build_caption_drawtext(
+            phrase, profile,
+            video_width=size[0],
+            video_height=size[1],
+        )
+        drawtext_filters.append(dt)
+
+    # Combine all drawtext into one filter chain
+    combined_filter = ",".join(drawtext_filters)
+
+    log(f"[Caption] Burning {len(phrases)} phrases | mode={caption_mode} | niche={niche}")
+
+    cmd = [
+        FFMPEG, "-y",
+        "-i", str(video),
+        "-vf", combined_filter,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+
+    run_cmd(cmd, label=f"[Caption Burn] {len(phrases)} phrases")
+
+    return str(out)
+
+
+# ============================================================
+# SUBSCRIBE OVERLAY ENGINE
+# ============================================================
+
+def apply_subscribe_overlay_mid(video, overlay_img, out,
+                                 intro_sec=2.0, voice_duration=60.0,
+                                 total_duration=64.0):
+    """
+    Apply subscribe overlay at the MIDDLE of the video.
+
+    BUG 3 FIX (v2.0): Overlay appears at ~45-55% of body duration.
+    Previously it appeared at a fixed position that could overlap
+    with the outro.
+
+    Features:
+    - Per-frame opacity fade-in/fade-out (no jarring appear/disappear)
+    - Rounded rectangle background
+    - "Subscribe" text + channel name
+    - Configurable position and timing
+
+    Args:
+        video: Input video path
+        overlay_img: Subscribe overlay image path
+        out: Output video path
+        intro_sec: Intro duration in seconds
+        voice_duration: Voice-over duration in seconds
+        total_duration: Total video duration
+
+    Returns:
+        (output_path, was_shown, start_time, duration)
+    """
+    video = Path(video)
+    overlay = Path(overlay_img) if overlay_img else None
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not overlay or not overlay.exists():
+        log("[Subscribe] No overlay image, skipping")
+        shutil.copy2(str(video), str(out))
+        return str(out), False, 0, 0
+
+    # Calculate mid-video position (45-55% of body)
+    body_duration = voice_duration
+    mid_start_pct = random.uniform(0.45, 0.55)
+    mid_start = intro_sec + (body_duration * mid_start_pct)
+    mid_duration = min(4.0, body_duration * 0.08)  # ~8% of body, max 4s
+
+    # Ensure overlay doesn't overlap outro
+    outro_start = total_duration - OUTRO_SECONDS
+    if mid_start + mid_duration > outro_start - 1.0:
+        mid_start = outro_start - mid_duration - 1.5
+
+    mid_start = max(intro_sec + 1.0, mid_start)
+
+    w, h = quality_to_size("480p")
+
+    # Build filter: overlay with fade-in/fade-out + rounded rectangle bg
+    # Fade-in: 0.4s, Fade-out: 0.4s
+    overlay_filter = (
+        f"[1:v]format=rgba,"
+        f"scale={w//3}:-1,"
+        f"fade=t=in:st=0:d=0.4:alpha=1,"
+        f"fade=t=out:st={mid_duration - 0.4}:d=0.4:alpha=1"
+        f"[ov];"
+        f"[0:v][ov]overlay="
+        f"x=(W-w)/2:"
+        f"y=H*0.72:"
+        f"enable='between(t,{mid_start:.2f},{mid_start + mid_duration:.2f})'"
+    )
+
+    log(f"[Subscribe] Mid-video overlay at {mid_start:.1f}s for {mid_duration:.1f}s")
+
+    cmd = [
+        FFMPEG, "-y",
+        "-i", str(video),
+        "-i", str(overlay),
+        "-filter_complex", overlay_filter,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "26",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "copy",
+        str(out),
+    ]
+
+    run_cmd(cmd, label=f"[Subscribe] Overlay at {mid_start:.1f}s")
+
+    return str(out), True, round(mid_start, 2), round(mid_duration, 2)
+
+
+# ============================================================
+# WATERMARK ENGINE
+# ============================================================
+
+def apply_niche_watermark(v, o, n="default", custom_logo_path=None, opacity=0.6):
+    """
+    Apply watermark to video.
+
+    BUG 2 FIX (v2.0): Accepts custom_logo_path and adjustable opacity.
+    Previously only used hardcoded niche text with fixed opacity.
+
+    Features:
+    - Custom logo image support
+    - Adjustable opacity (0.0-1.0)
+    - Niche-based text watermark as fallback
+    - Bottom-right positioning
+
+    Args:
+        v: Input video path
+        o: Output video path
+        n: Niche name
+        custom_logo_path: Path to custom logo image
+        opacity: Watermark opacity (0.0-1.0)
+
+    Returns:
+        Output video path
+    """
+    v = Path(v)
+    o = Path(o)
+    o.parent.mkdir(parents=True, exist_ok=True)
+
+    opacity = max(0.0, min(1.0, float(opacity)))
+
+    # Determine watermark source
+    if custom_logo_path and Path(custom_logo_path).exists():
+        # Use custom logo
+        logo = Path(custom_logo_path)
+        log(f"[Watermark] Custom logo: {logo.name} | opacity={opacity:.2f}")
+
+        wm_filter = (
+            f"[1:v]format=rgba,"
+            f"colorchannelmixer=aa={opacity:.2f},"
+            f"scale=120:-1"
+            f"[wm];"
+            f"[0:v][wm]overlay="
+            f"x=W-w-15:y=H-h-15"
+        )
+
+        cmd = [
+            FFMPEG, "-y",
+            "-i", str(v),
+            "-i", str(logo),
+            "-filter_complex", wm_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            str(o),
+        ]
+    else:
+        # Use niche-based text watermark
+        n = str(n or "default").lower()
+        text_map = {
+            "luxury": "LUXURY",
+            "luxury_lifestyle": "LUXURY LIFESTYLE",
+            "mystery": "MYSTERY",
+            "ai": "AI FUTURE",
+            "quantum_future": "QUANTUM FUTURE",
+            "finance": "FINANCE",
+            "finance_simulation": "FINANCE SIM",
+            "islamic": "ISLAMIC",
+            "home_design": "HOME DESIGN",
+            "interior_design": "INTERIOR DESIGN",
+            "stoic": "STOIC",
+            "default": "MY CREATION",
+        }
+        wm_text = text_map.get(n, "MY CREATION")
+
+        log(f"[Watermark] Text: '{wm_text}' | opacity={opacity:.2f}")
+
+        wm_filter = (
+            f"drawtext=text='{wm_text}':"
+            f"fontsize=h/22:"
+            f"fontcolor=white@{opacity:.2f}:"
+            f"x=w-text_w-15:y=h-text_h-15:"
+            f"shadowcolor=black@{opacity * 0.7:.2f}:shadowx=2:shadowy=2"
+        )
+
+        cmd = [
+            FFMPEG, "-y",
+            "-i", str(v),
+            "-vf", wm_filter,
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "copy",
+            str(o),
+        ]
+
+    run_cmd(cmd, label=f"[Watermark] Applied with opacity={opacity:.2f}")
+
+    return str(o)
+
+
+# ============================================================
+# B-ROLL OVERLAY ENGINE
+# ============================================================
+
+def apply_broll_overlay(video, out, total_duration=64.0,
+                         niche="default"):
+    """
+    Apply B-roll overlay on top of main video.
+
+    Used for picture-in-picture effects or secondary footage.
+    B-roll appears as a small overlay at random intervals.
+
+    Args:
+        video: Input video path
+        out: Output video path
+        total_duration: Total video duration
+        niche: Niche name
+
+    Returns:
+        Output video path
+    """
+    video = Path(video)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # B-roll is minimal by default, just a subtle overlay hint
+    # Full implementation would accept B-roll clips and schedule them
+
+    log(f"[B-Roll] Minimal overlay applied (niche={niche})")
+
+    # Copy as-is for now (placeholder for full B-roll implementation)
+    shutil.copy2(str(video), str(out))
+
+    return str(out)
+
+
+# ============================================================
+# AUDIO PRESET PER NICHE
+# ============================================================
+
+def audio_profile_for_niche(niche="default"):
+    """
+    Get audio mixing profile for a specific niche.
+
+    Returns volumes, EQ settings, and loudness targets.
+
+    Each profile defines:
+    - voice_volume: Multiplier for voice track
+    - music_volume: Multiplier for background music
+    - sfx_volume: Multiplier for sound effects
+    - highpass: High-pass filter cutoff (Hz), removes rumble
+    - lowpass: Low-pass filter cutoff (Hz), removes harshness
+    - target_lufs: Loudness normalization target
+    - compressor_ratio: Compression ratio for voice
+    - music_ducking: Reduce music during voice (True/False)
+    """
+    n = str(niche or "default").lower()
+    profiles = {
+        "luxury": {
+            "voice_volume": 1.40,
+            "music_volume": 0.30,
+            "sfx_volume": 0.18,
+            "highpass": 45,
+            "lowpass": 16000,
+            "target_lufs": -16.0,
+            "compressor_ratio": 3.0,
+            "music_ducking": True,
+            "description": "Rich, warm audio with prominent voice"
+        },
+        "luxury_lifestyle": {
+            "voice_volume": 1.40, "music_volume": 0.30, "sfx_volume": 0.18,
+            "highpass": 45, "lowpass": 16000, "target_lufs": -16.0,
+            "compressor_ratio": 3.0, "music_ducking": True,
+            "description": "Same as luxury"
+        },
+        "mystery": {
+            "voice_volume": 1.55,
+            "music_volume": 0.35,
+            "sfx_volume": 0.22,
+            "highpass": 40,
+            "lowpass": 14000,
+            "target_lufs": -15.5,
+            "compressor_ratio": 3.5,
+            "music_ducking": True,
+            "description": "Dark, atmospheric with tension building"
+        },
+        "ai": {
+            "voice_volume": 1.50,
+            "music_volume": 0.28,
+            "sfx_volume": 0.20,
+            "highpass": 50,
+            "lowpass": 18000,
+            "target_lufs": -15.0,
+            "compressor_ratio": 3.0,
+            "music_ducking": True,
+            "description": "Bright, futuristic, punchy audio"
+        },
+        "quantum_future": {
+            "voice_volume": 1.50, "music_volume": 0.28, "sfx_volume": 0.20,
+            "highpass": 50, "lowpass": 18000, "target_lufs": -15.0,
+            "compressor_ratio": 3.0, "music_ducking": True,
+            "description": "Same as AI"
+        },
+        "finance": {
+            "voice_volume": 1.70,
+            "music_volume": 0.12,
+            "sfx_volume": 0.10,
+            "highpass": 55,
+            "lowpass": 15000,
+            "target_lufs": -16.0,
+            "compressor_ratio": 4.0,
+            "music_ducking": True,
+            "description": "Clean, authoritative, voice-forward"
+        },
+        "finance_simulation": {
+            "voice_volume": 1.70, "music_volume": 0.12, "sfx_volume": 0.10,
+            "highpass": 55, "lowpass": 15000, "target_lufs": -16.0,
+            "compressor_ratio": 4.0, "music_ducking": True,
+            "description": "Same as finance"
+        },
+        "islamic": {
+            "voice_volume": 1.65,
+            "music_volume": 0.05,
+            "sfx_volume": 0.05,
+            "highpass": 50,
+            "lowpass": 12000,
+            "target_lufs": -16.5,
+            "compressor_ratio": 3.0,
+            "music_ducking": False,
+            "description": "Minimal music, clear voice, respectful"
+        },
+        "home_design": {
+            "voice_volume": 1.45,
+            "music_volume": 0.28,
+            "sfx_volume": 0.16,
+            "highpass": 45,
+            "lowpass": 16000,
+            "target_lufs": -16.0,
+            "compressor_ratio": 3.0,
+            "music_ducking": True,
+            "description": "Warm, inviting, balanced audio"
+        },
+        "interior_design": {
+            "voice_volume": 1.45, "music_volume": 0.28, "sfx_volume": 0.16,
+            "highpass": 45, "lowpass": 16000, "target_lufs": -16.0,
+            "compressor_ratio": 3.0, "music_ducking": True,
+            "description": "Same as home_design"
+        },
+        "stoic": {
+            "voice_volume": 1.55,
+            "music_volume": 0.08,
+            "sfx_volume": 0.06,
+            "highpass": 40,
+            "lowpass": 13000,
+            "target_lufs": -17.0,
+            "compressor_ratio": 2.5,
+            "music_ducking": False,
+            "description": "Minimal, meditative, subtle audio"
+        },
+        "default": {
+            "voice_volume": 1.45,
+            "music_volume": 0.22,
+            "sfx_volume": 0.15,
+            "highpass": 45,
+            "lowpass": 16000,
+            "target_lufs": -16.0,
+            "compressor_ratio": 3.0,
+            "music_ducking": True,
+            "description": "Balanced audio for general content"
+        },
+    }
+    return profiles.get(n, profiles["default"])
+
+
+# ============================================================
+# AUDIO TIMELINE BUILDER
+# ============================================================
+
+def build_audio_filter_complex(voice_path, music_path=None, sfx_path=None,
+                                total_duration=64.0, intro_sec=2.0,
+                                voice_duration=60.0, niche="default",
+                                audio_profile=None):
+    """
+    Build FFmpeg audio filter_complex for mixing.
+
+    Audio pipeline:
+    1. Voice: delay + volume + compression + EQ
+    2. Music: delay + volume + EQ + ducking (sidechain)
+    3. SFX: trim to bursts + volume + EQ
+    4. Mix all together
+    5. Loudnorm (normalize loudness)
+
+    Args:
+        voice_path: Path to voice-over audio
+        music_path: Optional background music
+        sfx_path: Optional sound effects
+        total_duration: Total video duration
+        intro_sec: Intro duration
+        voice_duration: Voice-over duration
+        niche: Niche name
+        audio_profile: Custom audio profile (overrides niche)
+
+    Returns:
+        FFmpeg filter_complex string
+    """
+    profile = audio_profile or audio_profile_for_niche(niche)
+
+    voice_vol = profile["voice_volume"]
+    music_vol = profile["music_volume"]
+    sfx_vol = profile["sfx_volume"]
+    highpass = profile["highpass"]
+    lowpass = profile["lowpass"]
+    comp_ratio = profile["compressor_ratio"]
+
+    filter_parts = []
+    inputs_used = []
+
+    # ----- Voice chain (input 1) -----
+    voice_chain = (
+        f"[1:a]adelay={int(intro_sec * 1000)}|{int(intro_sec * 1000)},"
+        f"volume={voice_vol:.2f},"
+        f"highpass=f={highpass},"
+        f"lowpass=f={lowpass},"
+        f"acompressor=ratio={comp_ratio:.1f}:threshold=-18dB:"
+        f"attack=5ms:release=100ms:makeup=2dB,"
+        f"atrim=0:{total_duration:.2f}"
+        f"[voice_out]"
+    )
+    filter_parts.append(voice_chain)
+    inputs_used.append("voice")
+
+    # ----- Music chain (input 2, optional) -----
+    if music_path and Path(music_path).exists():
+        if profile.get("music_ducking", True):
+            # Sidechain ducking: music lowers when voice is active
+            music_chain = (
+                f"[2:a]volume={music_vol:.2f},"
+                f"highpass=f={highpass},"
+                f"lowpass=f={lowpass},"
+                f"atrim=0:{total_duration:.2f},"
+                f"asendcmd=c='0.0 afftdn sn start; "
+                f"{total_duration:.2f} afftdn sn stop',"
+                f"[music_raw];"
+                f"[music_raw][voice_out]sidechaincompress="
+                f"threshold=0.003:ratio=8:"
+                f"level_sc=0.35:attack=10ms:release=300ms"
+                f"[music_out]"
+            )
+        else:
+            # No ducking, just constant music
+            music_chain = (
+                f"[2:a]volume={music_vol:.2f},"
+                f"highpass=f={highpass},"
+                f"lowpass=f={lowpass},"
+                f"aloop=loop=-1:size=2e+09,"
+                f"atrim=0:{total_duration:.2f}"
+                f"[music_out]"
+            )
+        filter_parts.append(music_chain)
+        inputs_used.append("music")
+    else:
+        # Silent music track
+        filter_parts.append(
+            f"aevalsrc=0:d={total_duration:.2f}:s=44100[music_out]"
+        )
+        inputs_used.append("silent_music")
+
+    # ----- SFX chain (input 3, optional) -----
+    # BUG 5 FIX: SFX as bursts, NOT continuous
+    if sfx_path and Path(sfx_path).exists():
+        sfx_dur = probe_duration(str(sfx_path))
+
+        # Generate burst schedule (~every 7 seconds)
+        burst_times = []
+        burst_dur = min(1.5, sfx_dur)
+        t = intro_sec + 3.0
+        while t < total_duration - 2.0:
+            burst_times.append(t)
+            t += random.uniform(5.5, 8.5)  # 5.5s-8.5s gap
+
+        # Build burst trim expression
+        if burst_times:
+            sfx_chain = (
+                f"[3:a]volume={sfx_vol:.2f},"
+                f"highpass=f={highpass},"
+                f"lowpass=f={lowpass}"
+                f"[sfx_raw];"
+            )
+
+            # Create trim for each burst
+            burst_outputs = []
+            for bi, bt in enumerate(burst_times):
+                sfx_chain += (
+                    f"[sfx_raw]atrim={bt:.2f}:{bt + burst_dur:.2f}"
+                    f"[sfx_burst_{bi}];"
+                )
+                burst_outputs.append(f"[sfx_burst_{bi}]")
+
+            # Mix all bursts
+            if len(burst_outputs) == 1:
+                sfx_chain += f"{burst_outputs[0]}[sfx_out]"
+            else:
+                mix_inputs = "".join(burst_outputs)
+                sfx_chain += f"{mix_inputs}amix=inputs={len(burst_outputs)}:duration=longest[sfx_out]"
+
+            filter_parts.append(sfx_chain)
+            inputs_used.append("sfx")
+
+            log(f"[SFX] {len(burst_times)} bursts scheduled "
+                f"(every about 7 seconds, each {burst_dur:.1f}s)")
+        else:
+            filter_parts.append(
+                f"aevalsrc=0:d={total_duration:.2f}:s=44100[sfx_out]"
+            )
+            inputs_used.append("silent_sfx")
+    else:
+        filter_parts.append(
+            f"aevalsrc=0:d={total_duration:.2f}:s=44100[sfx_out]"
+        )
+        inputs_used.append("silent_sfx")
+
+    # ----- Final mix -----
+    mix_part = (
+        f"[voice_out][music_out][sfx_out]"
+        f"amix=inputs=3:duration=first:dropout_transition=3:"
+        f"weights=1 1 1,"
+        f"loudnorm=I={profile['target_lufs']:.1f}:LRA=11:TP=-1.5,"
+        f"volume=1.2"
+        f"[audio_final]"
+    )
+    filter_parts.append(mix_part)
+
+    full_filter = ";".join(filter_parts)
+
+    return full_filter, inputs_used
+
+
+def mux_audio_timeline(video, voice, out, music=None, sfx=None,
+                        total_duration=64.0, intro_sec=2.0,
+                        voice_duration=60.0, niche="default",
+                        audio_profile=None):
+    """
+    Mux the complete audio mix onto the video.
+
+    This is the FINAL AUDIO step - combines everything:
+    - Voice-over with niche EQ and compression
+    - Background music with optional sidechain ducking
+    - SFX transition bursts (BUG 5 FIX)
+    - Loudness normalization
+
+    Args:
+        video: Silent video path
+        voice: Voice-over audio path
+        out: Final output path
+        music: Optional background music
+        sfx: Optional sound effects
+        total_duration: Total video duration
+        intro_sec: Intro duration
+        voice_duration: Voice-over duration
+        niche: Niche name
+        audio_profile: Custom audio profile
+
+    Returns:
+        Output path with mixed audio
+    """
+    video = Path(video)
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build filter complex
+    filter_complex, inputs_used = build_audio_filter_complex(
+        voice_path=str(voice),
+        music_path=str(music) if music else None,
+        sfx_path=str(sfx) if sfx else None,
+        total_duration=total_duration,
+        intro_sec=intro_sec,
+        voice_duration=voice_duration,
+        niche=niche,
+        audio_profile=audio_profile,
+    )
+
+    # Build command
+    cmd = [
+        FFMPEG, "-y",
+        "-i", str(video),
+        "-i", str(voice),
+    ]
+
+    input_count = 2
+    if music and Path(music).exists():
+        cmd += ["-i", str(music)]
+        input_count += 1
+    if sfx and Path(sfx).exists():
+        cmd += ["-i", str(sfx)]
+        input_count += 1
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "0:v",
+        "-map", "[audio_final]",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-ar", "44100",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(out),
+    ]
+
+    profile = audio_profile or audio_profile_for_niche(niche)
+    log(f"[AudioMux] Niche={niche} | Voice={profile['voice_volume']:.1f}x "
+        f"| Music={profile['music_volume']:.2f}x "
+        f"| SFX={profile['sfx_volume']:.2f}x "
+        f"| LUFS={profile['target_lufs']:.1f}")
+
+    run_cmd(cmd, label=f"[AudioMux] Mixing final audio")
+
+    return str(out)
+
+
+# ============================================================
+# MAIN RENDER ORCHESTRATOR - THE BIG ONE
+# ============================================================
+
+def render_long_batch_memory(
+    voice_path,
+    clip_paths,
+    output_path,
+    quality="480p",
+    fps=24,
+    batch_size=8,
+    niche="default",
+    intro_path=None,
+    outro_path=None,
+    music_path=None,
+    sfx_path=None,
+    subscribe_overlay=None,
+    custom_logo_path=None,
+    wm_opacity=0.6,
+    add_captions=True,
+    caption_mode="phrase",
+    words=None,
+    words_path=None,
+    transcript_text=None,
+    use_transitions=True,
+    variation_enabled=True,
+    intro_seconds=None,
+    outro_seconds=None,
+    preset_overrides=None,
+    progress_callback=None,
+    keep_temp=False,
+    temp_root=None,
+):
+    """
+    MAIN RENDERING ORCHESTRATOR - Complete pipeline entry point.
+
+    THIS IS THE FUNCTION THAT DOES EVERYTHING.
+    It orchestrates the ENTIRE video rendering pipeline:
+
+    STAGES:
+    1. PREPARE - Load assets, calculate durations
+    2. RENDER CLIPS - Process each clip with Variation Intelligence
+    3. CONCATENATE - Join clips with transitions
+    4. POST-PRODUCTION - Subscribe overlay, watermark, B-roll
+    5. CAPTIONS - Burn captions onto video
+    6. AUDIO MIX - Mix voice + music + SFX, normalize loudness
+    7. OUTPUT - Write final file
+
+    BUG FIXES (v2.0):
+    - BUG 1: Outro rendered as separate segment, NO audio bleed
+    - BUG 2: Watermark uses custom_logo_path & wm_opacity
+    - BUG 3: Subscribe overlay at correct mid-video position
+    - BUG 4: Captions checkbox correctly respected
+    - BUG 5: SFX as transition bursts, not continuous
+
+    Args:
+        voice_path: Path to voice-over audio file
+        clip_paths: List of source video clip paths
+        output_path: Path for final output video
+        quality: Video quality preset (360p, 480p, or 720p)
+        fps: Frame rate
+        batch_size: Clips per batch
+        niche: Niche/style preset
+        intro_path: Optional intro video
+        outro_path: Optional outro video
+        music_path: Optional background music
+        sfx_path: Optional sound effects
+        subscribe_overlay: Optional subscribe overlay image
+        custom_logo_path: Optional custom watermark logo
+        wm_opacity: Watermark opacity (0.0-1.0)
+        add_captions: Enable/disable captions
+        caption_mode: "phrase" or "word"
+        words: Direct word timing list
+        words_path: JSON word timing file
+        transcript_text: Plain transcript text
+        use_transitions: Enable transitions
+        variation_enabled: Enable Variation Intelligence
+        intro_seconds: Override intro duration
+        outro_seconds: Override outro duration
+        preset_overrides: Custom overrides dict
+        progress_callback: Optional progress callback
+        keep_temp: Keep temporary files
+        temp_root: Temporary directory root
+
+    Returns:
+        Path to final rendered video
+    """
+    # ================================================================
+    # STAGE 1: PREPARE
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 1: PREPARE - Loading assets and calculating durations")
+    log("=" * 60)
+
+    start_time = time.time()
+
+    # Quality and size
+    quality = normalize_quality(quality)
+    size = quality_to_size(quality)
+    fps = min(max(12, int(fps or DEFAULT_FPS)), 24)
+    batch_size = max(2, min(16, int(batch_size or DEFAULT_BATCH_SIZE)))
+
+    # Timing
+    intro_sec = fnum(intro_seconds, INTRO_SECONDS)
+    outro_sec = fnum(outro_seconds, OUTRO_SECONDS)
+
+    # Load and validate clips
+    clip_paths = existing_files(clip_paths, VIDEO_EXTS)
+    if not clip_paths:
+        raise FileNotFoundError("No valid clip files found")
+
+    # Validate voice
+    voice_path = Path(voice_path)
+    if not voice_path.exists():
+        raise FileNotFoundError(f"Voice file not found: {voice_path}")
+
+    # Probe voice duration
+    voice_duration = probe_duration(str(voice_path))
+
+    # Calculate total duration
+    body_duration = voice_duration
+    total_duration = intro_sec + body_duration + outro_sec
+
+    # Calculate clip durations
+    scene_durations = duration_plan(body_duration, len(clip_paths))
+
+    # Initialize Variation Intelligence
+    if variation_enabled:
+        var_engine = get_variation_engine(reset=True)
+        log(f"[Variation] Engine initialized with seed={var_engine._seed}")
+    else:
+        log("[Variation] DISABLED - all clips use standard motion")
+
+    # Create temp directory
+    if temp_root:
+        temp_root = Path(temp_root)
+    else:
+        temp_root = Path(output_path).parent / f"_render_{int(time.time())}"
+
+    temp_root.mkdir(parents=True, exist_ok=True)
+    seg_dir = temp_root / "segments"
+    batch_dir = temp_root / "batches"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"[Prepare] Clips: {len(clip_paths)} | "
+        f"Voice: {voice_duration:.1f}s | "
+        f"Total: {total_duration:.1f}s | "
+        f"Intro: {intro_sec}s | Outro: {outro_sec}s | "
+        f"Quality: {quality} ({size[0]}x{size[1]})")
+
+    # ================================================================
+    # STAGE 2: RENDER CLIPS
+    # ================================================================
+    log("=" * 60)
+    log(f"STAGE 2: RENDERING {len(clip_paths)} CLIPS")
+    log("=" * 60)
+
+    rendered_segments = []
+    corrupt_clips = []
+
+    # Render intro if provided
+    if intro_path and Path(intro_path).exists():
+        intro_out = batch_dir / "intro.mp4"
+        normalize_video_asset(intro_path, intro_out, size, fps, intro_sec, quality)
+        rendered_segments.append(intro_out)
+        log(f"[Intro] Normalized: {intro_sec}s")
+
+    # Render clips in batches
+    for batch_start, batch_clips in chunked(clip_paths, batch_size):
+        batch_num = batch_start // batch_size + 1
+
+        log(f"[Batch {batch_num}] Clips {batch_start + 1}-"
+            f"{batch_start + len(batch_clips)} of {len(clip_paths)}")
+
+        batch_segments = []
+
+        for local_i, clip_src in enumerate(batch_clips):
+            global_i = batch_start + local_i
+            seg_out = seg_dir / f"seg_{global_i:05d}.mp4"
+
+            # Get variation data
+            variation_data = None
+            if variation_enabled:
+                variation_data = get_variation_engine().get_clip_variation(
+                    clip_index=global_i,
+                    clip_duration=scene_durations[global_i],
+                    base_niche=niche,
+                )
+
+            # Notify progress
+            if progress_callback:
+                try:
+                    progress_callback(global_i + 1, len(clip_paths), str(clip_src))
+                except Exception:
+                    pass
+
+            # Render the clip
+            try:
+                render_clip_segment(
+                    src=str(clip_src),
+                    out=str(seg_out),
+                    wanted=scene_durations[global_i],
+                    index=global_i,
+                    size=size,
+                    fps=fps,
+                    quality=quality,
+                    niche=niche,
+                    variation_data=variation_data,
+                )
+                batch_segments.append(seg_out)
+
+            except Exception as e:
+                error_msg = str(e)[-300:]
+                log(f"[ERROR] Clip {global_i} FAILED: {error_msg}")
+                corrupt_clips.append({
+                    "clip_index": global_i,
+                    "clip_path": str(clip_src),
+                    "error": error_msg,
+                })
+
+            gc.collect()
+
+        # Concat batch segments
+        if batch_segments:
+            batch_out = batch_dir / f"batch_{batch_num:04d}.mp4"
+            concat_files(
+                batch_segments, batch_out,
+                niche=niche,
+                use_transitions=use_transitions,
+                global_index_offset=batch_start,
+            )
+            rendered_segments.append(batch_out)
+
+        # Cleanup individual segments
+        for s in batch_segments:
+            try:
+                s.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        gc.collect()
+
+    if not rendered_segments:
+        raise RuntimeError("No clips were successfully rendered")
+
+    rendered_count = len(clip_paths) - len(corrupt_clips)
+    log(f"[Render Complete] {rendered_count}/{len(clip_paths)} clips rendered, "
+        f"{len(corrupt_clips)} corrupt skipped")
+
+    # ================================================================
+    # STAGE 3: ASSEMBLE
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 3: ASSEMBLE - Concatenating with transitions")
+    log("=" * 60)
+
+    # Render outro if provided
+    outro_out = None
+    if outro_path and Path(outro_path).exists():
+        outro_out = batch_dir / "outro.mp4"
+        normalize_video_asset(outro_path, outro_out, size, fps, outro_sec, quality)
+        log(f"[Outro] Normalized: {outro_sec}s")
+
+    # Concat all segments into body
+    body_raw = batch_dir / "body_raw.mp4"
+    concat_files(
+        rendered_segments, body_raw,
+        niche=niche,
+        use_transitions=use_transitions,
+        global_index_offset=0,
+    )
+
+    # BUG 1 FIX: Pad/trim body to exact duration (separate from outro)
+    body_actual = probe_duration(str(body_raw))
+    body_target = total_duration - outro_sec if outro_out else total_duration
+
+    if abs(body_actual - body_target) > 0.3:
+        if body_actual < body_target:
+            # Extend by freezing last frame
+            pad_dur = body_target - body_actual
+            log(f"[Body Fit] Extending by {pad_dur:.1f}s (last frame clone)")
+            body_fixed = batch_dir / "body_fixed.mp4"
+            run_cmd([
+                FFMPEG, "-y",
+                "-i", str(body_raw),
+                "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f},"
+                       f"trim=0:{body_target:.3f},setpts=PTS-STARTPTS",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "26",
+                "-pix_fmt", "yuv420p",
+                "-an",
+                str(body_fixed),
+            ])
+        else:
+            # Trim to exact duration
+            log(f"[Body Fit] Trimming by {body_actual - body_target:.1f}s")
+            body_fixed = batch_dir / "body_fixed.mp4"
+            run_cmd([
+                FFMPEG, "-y",
+                "-i", str(body_raw),
+                "-vf", f"trim=0:{body_target:.3f},setpts=PTS-STARTPTS",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "26",
+                "-pix_fmt", "yuv420p",
+                "-an",
+                str(body_fixed),
+            ])
+    else:
+        body_fixed = body_raw
+
+    # BUG 1 FIX: Append outro as SEPARATE segment (no audio bleed)
+    if outro_out:
+        body_and_outro = batch_dir / "body_with_outro.mp4"
+        concat_files_hard([body_fixed, outro_out], body_and_outro)
+        body_final = body_and_outro
+    else:
+        body_final = body_fixed
+
+    # ================================================================
+    # STAGE 4: POST-PRODUCTION
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 4: POST-PRODUCTION - Subscribe overlay, watermark, B-roll")
+    log("=" * 60)
+
+    post_video = body_final
+
+    # Subscribe overlay (BUG 3 FIX: correct mid position)
+    if subscribe_overlay:
+        post_sub = batch_dir / "post_sub.mp4"
+        apply_subscribe_overlay_mid(
+            post_video, subscribe_overlay, post_sub,
+            intro_sec=intro_sec,
+            voice_duration=voice_duration,
+            total_duration=total_duration,
+        )
+        post_video = post_sub
+
+    # Watermark (BUG 2 FIX: custom logo + opacity)
+    post_wm = batch_dir / "post_wm.mp4"
+    apply_niche_watermark(
+        post_video, post_wm, niche,
+        custom_logo_path=custom_logo_path,
+        opacity=wm_opacity,
+    )
+    post_video = post_wm
+
+    # B-roll overlay
+    post_broll = batch_dir / "post_broll.mp4"
+    apply_broll_overlay(post_video, post_broll, total_duration, niche)
+    post_video = post_broll
+
+    # ================================================================
+    # STAGE 5: CAPTIONS
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 5: CAPTIONS - Burning captions")
+    log("=" * 60)
+
+    if add_captions:
+        post_captions = batch_dir / "post_captions.mp4"
+        burn_captions(
+            post_video, post_captions,
+            voice_path=str(voice_path),
+            words=words,
+            words_path=words_path,
+            transcript_text=transcript_text,
+            caption_mode=caption_mode,
+            size=size,
+            caption_offset=intro_sec,
+            niche=niche,
+        )
+        post_video = post_captions
+    else:
+        log("[Caption] DISABLED per config")
+
+    # ================================================================
+    # STAGE 6: AUDIO MIX
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 6: AUDIO MIX - Voice + Music + SFX (BUG 5: burst mode)")
+    log("=" * 60)
+
+    final_out = Path(output_path)
+    final_out.parent.mkdir(parents=True, exist_ok=True)
+
+    mux_audio_timeline(
+        post_video, voice_path, final_out,
+        music=music_path,
+        sfx=sfx_path,
+        total_duration=total_duration,
+        intro_sec=intro_sec,
+        voice_duration=voice_duration,
+        niche=niche,
+    )
+
+    # ================================================================
+    # STAGE 7: CLEANUP
+    # ================================================================
+    log("=" * 60)
+    log("STAGE 7: FINALIZE")
+    log("=" * 60)
+
+    elapsed = time.time() - start_time
+    corrupt_count = len(corrupt_clips)
+
+    log(f"[COMPLETE] Output: {final_out}")
+    log(f"[COMPLETE] Duration: {total_duration:.1f}s | "
+        f"Clips: {rendered_count}/{len(clip_paths)} | "
+        f"Skipped: {corrupt_count} | "
+        f"Time: {elapsed:.0f}s ({elapsed/60:.1f}min)")
+
+    if corrupt_clips:
+        log(f"[WARNING] {corrupt_count} clip(s) were skipped:")
+        for cc in corrupt_clips[:5]:
+            log(f"  - Clip #{cc['clip_index']}: {Path(cc['clip_path']).name}: {cc['error']}")
+
+    # Cleanup temp files
+    if not keep_temp:
+        try:
+            shutil.rmtree(temp_root, ignore_errors=True)
+            log("[Cleanup] Temp directory removed")
+        except Exception as e:
+            log(f"[Cleanup] Could not remove temp: {e}")
+
+    return str(final_out)

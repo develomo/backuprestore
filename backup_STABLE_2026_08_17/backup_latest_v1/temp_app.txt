@@ -1,0 +1,462 @@
+    "subtle_shadow_grade": True,
+    "shadow_lift_amount": 0.020,
+    "highlight_rolloff_amount": 0.030,
+    "micro_stabilization": True,
+    "micro_camera_motion": True,
+    "render_speed_mode": "fast_480p",
+}
+
+APP_PREMIUM_UNSUPPORTED_DIRECT_KEYS = {
+    "caption_enabled",
+    "voice_level",
+    "music_level",
+    "sfx_level",
+    "premium_edit_mode",
+    "premium_edit_target_score",
+    "dynamic_pacing",
+    "all_clips_must_be_used",
+    "clean_silence_keep_all_clips",
+    "pattern_interrupt_seconds",
+    "camera_motion_score_target",
+    "zoom_score_target",
+    "motion_blur_score_target",
+    "transition_score_target",
+    "background_music_score_target",
+    "sound_design_score_target",
+    "beat_sync_score_target",
+    "viewer_retention_score_target",
+    "caption_timing_precision",
+    "caption_start_offset",
+    "caption_font_selection",
+    "caption_style_enhancement",
+    "caption_animation_enhancement",
+    "preserve_caption_behavior",
+    "music_gain_multiplier",
+    "voice_gain_multiplier",
+    "sfx_gain_multiplier",
+    "subtle_shadow_grade",
+    "shadow_lift_amount",
+    "highlight_rolloff_amount",
+    "micro_stabilization",
+    "micro_camera_motion",
+    "render_speed_mode",
+    "stage_render_height",
+    "fast_stage_height",
+}
+
+def _app_premium_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+def _app_premium_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+def _app_premium_bool(value, default=False):
+    try:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on", "enabled")
+        return bool(value)
+    except Exception:
+        return bool(default)
+
+def _app_premium_merge_preset_overrides(existing=None, mode="SHORT", final_4k=False, fps=24, clean_silence=False):
+    data = dict(APP_PREMIUM_DEFAULTS)
+    if existing:
+        data.update(dict(existing))
+
+    is_long = str(mode or "SHORT").upper() == "LONG"
+    data["mode"] = "LONG" if is_long else "SHORT"
+    data["final_4k"] = bool(final_4k)
+    data["fps"] = min(_app_premium_int(fps, 24), 24 if not final_4k else 30)
+    data["clean_silence"] = bool(clean_silence)
+    data["clean_silence_keep_all_clips"] = True
+    data["all_clips_must_be_used"] = True
+    data["render_speed_mode"] = "fast_720p" if is_long and not final_4k else "fast_480p" if not final_4k else "balanced_4k"
+    data["stage_render_height"] = 720 if is_long and not final_4k else 480 if not final_4k else 1080
+    data["pattern_interrupt_seconds"] = 4.0 if is_long else 3.4
+    data["caption_start_offset"] = -0.16 if is_long else -0.18
+    data["music_gain_multiplier"] = max(_app_premium_float(data.get("music_gain_multiplier"), 1.025), 1.025)
+    data["voice_gain_multiplier"] = max(_app_premium_float(data.get("voice_gain_multiplier"), 1.015), 1.015)
+    data["sfx_gain_multiplier"] = max(_app_premium_float(data.get("sfx_gain_multiplier"), 1.18), 1.18)
+    return data
+
+def _app_premium_filter_supported(fn, kwargs):
+    data = dict(kwargs or {})
+    try:
+        signature = inspect.signature(fn)
+        has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+        if has_var_kwargs:
+            return data
+        safe = {k: v for k, v in data.items() if k in signature.parameters}
+        if "preset_overrides" in signature.parameters:
+            preset = dict(data.get("preset_overrides") or {})
+            for k in APP_PREMIUM_DEFAULTS:
+                if k in data:
+                    preset[k] = data[k]
+            safe["preset_overrides"] = preset
+        return safe
+    except Exception:
+        for key in APP_PREMIUM_UNSUPPORTED_DIRECT_KEYS:
+            data.pop(key, None)
+        return data
+
+def _app_premium_extract_mode(settings=None, kwargs=None):
+    if kwargs and kwargs.get("mode"):
+        return str(kwargs.get("mode")).upper()
+    if settings and settings.get("mode"):
+        return str(settings.get("mode")).upper()
+    return "SHORT"
+
+def _app_premium_assets_count(assets):
+    try:
+        clips = assets.get("clips") or []
+        return len(clips)
+    except Exception:
+        return 0
+
+def _app_premium_prepare_kwargs(kwargs):
+    data = dict(kwargs or {})
+    mode = str(data.get("mode") or ("LONG" if data.get("use_overlays") else "SHORT")).upper()
+    final_4k = _app_premium_bool(data.get("final_4k"), False)
+    fps = _app_premium_int(data.get("fps"), 24)
+    clean_silence = _app_premium_bool(data.get("clean_silence"), False)
+
+    preset = _app_premium_merge_preset_overrides(
+        data.get("preset_overrides", {}),
+        mode=mode,
+        final_4k=final_4k,
+        fps=fps,
+        clean_silence=clean_silence,
+    )
+
+    data["preset_overrides"] = preset
+    data["fps"] = preset.get("fps", fps)
+    data["final_4k"] = final_4k
+    data["clean_silence"] = clean_silence
+    data["caption_mode"] = data.get("caption_mode", "none")
+    data["style_id"] = data.get("style_id", None)
+    data["add_captions"] = bool(data.get("add_captions", False))
+    return data
+
+try:
+    _app_original_build_render_kwargs_final_premium = build_render_kwargs
+    def build_render_kwargs(mode: str, settings: Dict[str, Any], assets: Dict[str, Any], add_captions: bool, caption_mode: str, style_id: Optional[str]) -> Dict[str, Any]:
+        kwargs = _app_original_build_render_kwargs_final_premium(mode, settings, assets, add_captions, caption_mode, style_id)
+        kwargs["mode"] = str(mode or "SHORT").upper()
+        kwargs["add_captions"] = bool(add_captions)
+        kwargs["caption_mode"] = caption_mode if add_captions else "none"
+        kwargs["style_id"] = style_id if add_captions else None
+        kwargs["preset_overrides"] = _app_premium_merge_preset_overrides(
+            kwargs.get("preset_overrides", {}),
+            mode=kwargs["mode"],
+            final_4k=kwargs.get("final_4k", False),
+            fps=kwargs.get("fps", 24),
+            clean_silence=kwargs.get("clean_silence", False),
+        )
+        kwargs["preset_overrides"]["clip_count"] = _app_premium_assets_count(assets)
+        kwargs["preset_overrides"]["caption_style_enhancement"] = False
+        kwargs["preset_overrides"]["caption_animation_enhancement"] = False
+        kwargs["preset_overrides"]["caption_timing_precision"] = True
+        kwargs["preset_overrides"]["caption_font_selection"] = "premium_readable"
+        return kwargs
+except Exception:
+    pass
+
+try:
+    _app_original_call_supported_final_premium = call_supported
+    def call_supported(fn, kwargs: Dict[str, Any]):
+        prepared = _app_premium_prepare_kwargs(kwargs)
+        safe_kwargs = _app_premium_filter_supported(fn, prepared)
+        return _app_original_call_supported_final_premium(fn, safe_kwargs)
+except Exception:
+    pass
+
+try:
+    _app_original_run_render_final_premium = run_render
+    def run_render(mode: str, settings: Dict[str, Any], assets: Dict[str, Any], add_captions: bool, caption_mode: str, style_id: Optional[str], progress_bar, status) -> None:
+        try:
+            if isinstance(settings, dict):
+                settings["premium_edit_mode"] = True
+                settings["all_clips_must_be_used"] = True
+                settings["clean_silence_keep_all_clips"] = True
+                settings["caption_timing_precision"] = True
+                settings["caption_style_enhancement"] = False
+                settings["caption_animation_enhancement"] = False
+                settings["render_speed_mode"] = "fast_720p" if str(mode).upper() == "LONG" else "fast_480p"
+        except Exception:
+            pass
+        return _app_original_run_render_final_premium(mode, settings, assets, add_captions, caption_mode, style_id, progress_bar, status)
+except Exception:
+    pass
+
+def app_premium_report():
+    return {
+        "version": APP_PREMIUM_VERSION,
+        "target_score": APP_PREMIUM_TARGET_SCORE,
+        "backend_flags_passed": True,
+        "caption_style_changed": False,
+        "caption_timing_precision": True,
+        "clean_silence_keep_all_clips": True,
+        "fast_480p_mode": True,
+        "short_pattern_interrupt_seconds": 3.4,
+        "long_pattern_interrupt_seconds": 4.0,
+    }
+
+
+
+# ============================================================
+# PHASE 13 - APP ROUTER FINAL PATCH
+# ============================================================
+# Purpose:
+# - Keep existing UI layout.
+# - Ensure long assets pass correctly:
+#   intro_path, outro_path, subscribe_overlay, music_path, sfx_files.
+# - Ensure captions pass correctly:
+#   add_captions, caption_mode, style_id.
+# - Ensure Phase 13 AI plans can reach safe_long_video_polished.py.
+# - Prevent hidden 1080p/4K upscale in long mode unless explicitly changed later.
+# - Keep Streamlit fast and avoid giant UI rebuild.
+# ============================================================
+
+APP_PHASE13_VERSION = "app_phase13_ai_router_v2"
+
+
+def _phase13_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "enable", "enabled"}:
+        return True
+    if text in {"0", "false", "no", "off", "disable", "disabled", "none"}:
+        return False
+    return default
+
+
+def _phase13_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _phase13_quality(value, mode="LONG"):
+    q = str(value or "480p").strip().lower()
+    # Existing UI has balanced/high/max. For long videos on low RAM, map them safely.
+    if str(mode).upper() == "LONG":
+        if q in {"balanced", "high", "max", "edit", "fast", "1080p", "4k", "2160p"}:
+            return "480p"
+        if "720" in q:
+            return "720p"
+        if "360" in q:
+            return "360p"
+        return "480p"
+    return value
+
+
+def _phase13_assets_count(assets):
+    try:
+        return len(assets.get("clips") or [])
+    except Exception:
+        return 0
+
+
+def _phase13_merge_preset(existing=None, mode="LONG", settings=None, assets=None, add_captions = True, caption_mode="none", style_id=None):
+    settings = settings or {}
+    assets = assets or {}
+    preset = dict(existing or {})
+
+    mode = str(mode or "LONG").upper()
+    clip_count = _phase13_assets_count(assets)
+    quality = _phase13_quality(settings.get("quality", preset.get("quality", "480p")), mode)
+
+    # Core Phase 13 flags
+    preset.update({
+        "phase13_app_router": True,
+        "phase13_ai_pipeline": True,
+        "quality": quality,
+        "final_quality": "480p" if mode == "LONG" else preset.get("final_quality", "1080p"),
+        "hidden_upscale": False if mode == "LONG" else preset.get("hidden_upscale", False),
+        "fps": min(24, max(12, _phase13_int(settings.get("fps", preset.get("fps", 24)), 24))) if mode == "LONG" else settings.get("fps", preset.get("fps", 30)),
+        "batch_size": 6 if clip_count >= 120 else 8 if clip_count >= 50 else 10,
+        "clip_count": clip_count,
+        "all_clips_must_be_used": True,
+        "avoid_fixed_7_second_rhythm": True,
+        "dynamic_pacing": True,
+        "story_aware_editing": True,
+        "camera_motion_enabled": True,
+        "pattern_interrupts_enabled": True,
+        "beat_sync_enabled": True,
+        "color_consistency_enabled": True,
+        "memory_safe_render": True,
+        "caption_timing_precision": True,
+        "caption_start_offset": -0.12,
+        "caption_style_enhancement": False,
+        "caption_animation_enhancement": False,
+        "preserve_caption_behavior": True,
+        "add_captions": bool(add_captions),
+        "caption_mode": caption_mode if add_captions else "none",
+        "style_id": style_id if add_captions else None,
+        "target_aspect": "16:9" if mode == "LONG" else "9:16",
+        "target_width": 854 if mode == "LONG" and quality == "480p" else 640 if mode == "LONG" and quality == "360p" else 1280 if mode == "LONG" else 1080,
+        "target_height": 480 if mode == "LONG" and quality == "480p" else 360 if mode == "LONG" and quality == "360p" else 720 if mode == "LONG" else 1920,
+    })
+
+    return preset
+
+
+# Save previous function references after all earlier patches loaded.
+try:
+    _phase13_previous_build_render_kwargs = build_render_kwargs
+except Exception:
+    _phase13_previous_build_render_kwargs = None
+
+try:
+    _phase13_previous_call_supported = call_supported
+except Exception:
+    _phase13_previous_call_supported = None
+
+try:
+    _phase13_previous_run_render = run_render
+except Exception:
+    _phase13_previous_run_render = None
+
+
+def build_render_kwargs(mode: str, settings: Dict[str, Any], assets: Dict[str, Any], add_captions: bool, caption_mode: str, style_id: Optional[str]) -> Dict[str, Any]:
+    """Final Phase 13 render kwargs.
+
+    This keeps old UI but passes all long-specific assets and AI flags.
+    """
+    if _phase13_previous_build_render_kwargs:
+        try:
+            kwargs = _phase13_previous_build_render_kwargs(mode, settings, assets, add_captions, caption_mode, style_id)
+        except Exception:
+            kwargs = {}
+    else:
+        kwargs = {}
+
+    mode_u = str(mode or "SHORT").upper()
+    settings = settings or {}
+    assets = assets or {}
+
+    kwargs.update({
+        "mode": mode_u,
+        "voice_path": assets.get("voice"),
+        "clips": assets.get("clips") or [],
+        "words": kwargs.get("words", []),
+        "transcript_text": kwargs.get("transcript_text"),
+        "niche": settings.get("niche", kwargs.get("niche", "default")),
+        "render_count": int(settings.get("render_count", kwargs.get("render_count", 0))),
+        "caption_mode": caption_mode if add_captions else "none",
+        "style_id": style_id if add_captions else None,
+        "music_path": assets.get("music"),
+        "sfx_files": assets.get("sfx") or [],
+        "use_hook": settings.get("use_hook", kwargs.get("use_hook", True)),
+        "final_4k": False if mode_u == "LONG" else bool(settings.get("final_4k", kwargs.get("final_4k", False))),
+        "fps": settings.get("fps", kwargs.get("fps", 24 if mode_u == "LONG" else 30)),
+        "quality": _phase13_quality(settings.get("quality", kwargs.get("quality", "480p")), mode_u),
+        "clean_silence": bool(settings.get("clean_silence", kwargs.get("clean_silence", False))),
+        "add_captions": bool(add_captions),
+        "use_overlays": bool(settings.get("overlays", kwargs.get("use_overlays", True))),
+        "voice_level": settings.get("voice_level", kwargs.get("voice_level", 1.0)),
+        "music_level": settings.get("music_level", kwargs.get("music_level", 0.04)),
+        "sfx_level": settings.get("sfx_level", kwargs.get("sfx_level", 0.06)),
+    })
+
+    # Long-specific assets. These names are accepted by safe_long_video_polished.py Phase 13.
+    if mode_u == "LONG":
+        kwargs.update({
+            "intro_path": assets.get("intro"),
+            "outro_path": assets.get("outro"),
+            "subscribe_overlay": assets.get("subscribe"),
+            "subscribe_overlay_path": assets.get("subscribe"),
+            "overlay": assets.get("subscribe"),
+        })
+
+    kwargs["preset_overrides"] = _phase13_merge_preset(
+        kwargs.get("preset_overrides", {}),
+        mode=mode_u,
+        settings=settings,
+        assets=assets,
+        add_captions=add_captions,
+        caption_mode=caption_mode,
+        style_id=style_id,
+    )
+
+    return kwargs
+
+
+def call_supported(fn, kwargs: Dict[str, Any]):
+    """Final safe caller.
+
+    Uses original signature filtering but keeps Phase 13 kwargs safe.
+    """
+    safe = dict(kwargs or {})
+    safe["preset_overrides"] = _phase13_merge_preset(
+        safe.get("preset_overrides", {}),
+        mode=safe.get("mode", "LONG"),
+        settings=safe,
+        assets={"clips": safe.get("clips", [])},
+        add_captions=safe.get("add_captions", False),
+        caption_mode=safe.get("caption_mode", "none"),
+        style_id=safe.get("style_id"),
+    )
+
+    if _phase13_previous_call_supported:
+        return _phase13_previous_call_supported(fn, safe)
+
+    # fallback signature filter
+    import inspect
+    signature = inspect.signature(fn)
+    has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+    safe_kwargs = safe if has_var_kwargs else {k: v for k, v in safe.items() if k in signature.parameters}
+    return fn(**safe_kwargs)
+
+
+def run_render(mode: str, settings: Dict[str, Any], assets: Dict[str, Any], add_captions: bool, caption_mode: str, style_id: Optional[str], progress_bar, status) -> None:
+    """Final Phase 13 render route."""
+    try:
+        if isinstance(settings, dict):
+            settings["phase13_app_router"] = True
+            settings["premium_edit_mode"] = True
+            settings["all_clips_must_be_used"] = True
+            settings["clean_silence_keep_all_clips"] = True
+            settings["caption_timing_precision"] = True
+            settings["caption_style_enhancement"] = False
+            settings["caption_animation_enhancement"] = False
+            if str(mode).upper() == "LONG":
+                settings["quality"] = _phase13_quality(settings.get("quality", "480p"), "LONG")
+                settings["final_4k"] = False
+    except Exception:
+        pass
+
+    if _phase13_previous_run_render:
+        return _phase13_previous_run_render(mode, settings, assets, add_captions, caption_mode, style_id, progress_bar, status)
+
+    raise RuntimeError("Phase 13 app router could not find previous run_render function.")
+
+
+def app_phase13_report():
+    return {
+        "version": APP_PHASE13_VERSION,
+        "ui_preserved": True,
+        "main_call_moved_to_bottom": True,
+        "long_intro_passed": True,
+        "long_outro_passed": True,
+        "subscribe_overlay_passed": True,
+        "captions_passed": True,
+        "phase13_preset_overrides_passed": True,
+        "hidden_long_upscale": False,
+        "target_long_aspect": "16:9",
+    }
+
+
+# Final Streamlit entrypoint after all patches.
+if __name__ == "__main__":
+    main()

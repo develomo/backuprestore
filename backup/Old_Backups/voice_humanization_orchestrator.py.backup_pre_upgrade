@@ -1,0 +1,780 @@
+# voice_humanization_orchestrator.py
+# ==========================================================
+# MY CREATION VIDEO GENERATOR
+# VOICE HUMANIZATION ORCHESTRATOR v3.0
+# ==========================================================
+# Purpose:
+# - AI/TTS voice ko clean, natural, less robotic banana.
+# - voice_settings_manager.py ke profiles ko apply karna.
+# - FFmpeg based safe processing pipeline chalana.
+# - Original voice file ko overwrite na karna.
+# - Shorts aur Long ke liye alag mastering behavior.
+# - professional_voice_engine.py ko stable callable API dena.
+#
+# IMPORTANT:
+# Ye file fake human breathing ko loud nahi banati.
+# Ye voice ko extreme pitch shift nahi karti.
+# Ye subtle processing karti hai:
+#   - EQ cleanup
+#   - compression
+#   - tiny loudness control
+#   - optional micro tempo variation
+#   - optional pause-safe mastering
+#   - loudness normalization
+#
+# WHY SUBTLE?
+# Over-processing voice can create:
+#   - metallic artifacts
+#   - robotic warble
+#   - unnatural pitch
+#   - broken timing
+#   - bad caption sync
+#
+# User wants production-level voice, not fake effect.
+# ==========================================================
+
+import json
+import subprocess
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from voice_settings_manager import (
+        resolve_voice_profile,
+        resolve_voice_profile_for_render,
+        sanitize_voice_profile,
+        DEFAULT_PROFILE_NAME,
+    )
+except Exception:
+    resolve_voice_profile = None
+    resolve_voice_profile_for_render = None
+    sanitize_voice_profile = None
+    DEFAULT_PROFILE_NAME = "warm_measured"
+
+
+BASE_DIR = Path(__file__).parent
+OUT_DIR = BASE_DIR / "outputs" / "voice_orchestrator"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TEMP_DIR = BASE_DIR / "outputs" / "temp_voice"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = OUT_DIR / "voice_orchestrator_log.json"
+
+
+# ==========================================================
+# SAFE HELPERS
+# ==========================================================
+
+def safe_print(message):
+    try:
+        text = str(message).replace("→", "->").replace("—", "-").replace("–", "-")
+        print(text, flush=True)
+    except Exception:
+        pass
+
+
+def _mode_key(mode):
+    mode = str(mode or "short").lower().strip()
+    if mode in ("long", "youtube_long", "horizontal"):
+        return "long"
+    return "short"
+
+
+def _safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _clean_file_stem(text):
+    text = str(text or "voice")
+    safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in text)
+    return safe.strip("_") or "voice"
+
+
+def _run_ffmpeg(cmd, label="ffmpeg"):
+    safe_print(f"[VoiceOrchestrator] Running {label}...")
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+
+    if result.returncode != 0:
+        safe_print(result.stderr)
+        raise RuntimeError(f"{label} failed")
+
+    return True
+
+
+def _append_log(entry):
+    try:
+        data = []
+        if LOG_FILE.exists():
+            data = json.loads(LOG_FILE.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                data = []
+        data.append(entry)
+        LOG_FILE.write_text(json.dumps(data[-300:], indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _default_profile(content_hint=None):
+    if resolve_voice_profile:
+        try:
+            return resolve_voice_profile(content_hint=content_hint)
+        except Exception:
+            pass
+
+    return {
+        "name": DEFAULT_PROFILE_NAME,
+        "pitch_drift_cents": 28,
+        "pace_variation_pct": 0.04,
+        "pause_extension_ms": 100,
+        "volume_variation_db": 1.2,
+        "breath_layer_db": -38,
+        "voice_gain": 1.03,
+        "compression_ratio": 2.1,
+        "highpass_hz": 80,
+        "lowpass_hz": 11500,
+        "description": "Fallback voice profile.",
+    }
+
+
+def _resolve_profile(profile=None, content_hint=None, render_plan=None):
+    if profile:
+        try:
+            if sanitize_voice_profile:
+                return sanitize_voice_profile(profile)
+            return dict(profile)
+        except Exception:
+            return dict(profile)
+
+    render_count = 0
+    selected_profile = None
+
+    if render_plan:
+        try:
+            content_hint = content_hint or render_plan.get("niche")
+            selected_profile = render_plan.get("voice_plan", {}).get("profile_name")
+            render_count = int(render_plan.get("variation_plan", {}).get("render_count", 0))
+        except Exception:
+            pass
+
+    if resolve_voice_profile_for_render:
+        try:
+            return resolve_voice_profile_for_render(
+                selected_profile=selected_profile,
+                content_hint=content_hint,
+                render_count=render_count,
+                variation_strength=1.0,
+            )
+        except Exception:
+            pass
+
+    return _default_profile(content_hint=content_hint)
+
+
+def _output_path(input_audio, mode, profile):
+    input_audio = Path(input_audio)
+    profile_name = _clean_file_stem(profile.get("name", "profile"))
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return OUT_DIR / f"{input_audio.stem}_{mode}_{profile_name}_humanized_{ts}.wav"
+
+
+# ==========================================================
+# FFPROBE / DURATION
+# ==========================================================
+
+def get_audio_duration(path):
+    path = Path(path)
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "json",
+        str(path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+
+    if result.returncode != 0:
+        return 0.0
+
+    try:
+        return float(json.loads(result.stdout)["format"]["duration"])
+    except Exception:
+        return 0.0
+
+
+# ==========================================================
+# FILTER BUILDERS
+# ==========================================================
+
+def _tempo_filter_from_profile(profile, mode="short"):
+    """
+    Applies extremely tiny tempo adjustment.
+
+    Important:
+    This is not random speed change every sentence.
+    Sentence-level advanced processing would require slicing and
+    recombining audio, which can hurt caption sync.
+    So we keep global tempo very close to 1.0.
+    """
+    pace_var = _safe_float(profile.get("pace_variation_pct"), 0.04)
+
+    if _mode_key(mode) == "long":
+        tempo = 1.0 - min(pace_var * 0.18, 0.012)
+    else:
+        tempo = 1.0 + min(pace_var * 0.12, 0.010)
+
+    tempo = _clamp(tempo, 0.985, 1.012)
+
+    return f"atempo={tempo:.5f}", tempo
+
+
+def _eq_filter(profile, mode="short"):
+    highpass = int(_clamp(_safe_float(profile.get("highpass_hz"), 80), 60, 140))
+    lowpass = int(_clamp(_safe_float(profile.get("lowpass_hz"), 11500), 7500, 14000))
+
+    # Mild harshness cleanup.
+    if _mode_key(mode) == "long":
+        harsh_cut = -0.8
+    else:
+        harsh_cut = -1.1
+
+    return (
+        f"highpass=f={highpass},"
+        f"lowpass=f={lowpass},"
+        f"equalizer=f=3300:t=q:w=1.2:g={harsh_cut},"
+        f"equalizer=f=7800:t=q:w=1.0:g=-0.7"
+    )
+
+
+def _compressor_filter(profile, mode="short"):
+    ratio = _clamp(_safe_float(profile.get("compression_ratio"), 2.1), 1.4, 3.2)
+
+    if _mode_key(mode) == "long":
+        threshold = "-20dB"
+        attack = 10
+        release = 90
+    else:
+        threshold = "-19dB"
+        attack = 6
+        release = 70
+
+    return f"acompressor=threshold={threshold}:ratio={ratio:.2f}:attack={attack}:release={release}"
+
+
+def _volume_filter(profile):
+    gain = _clamp(_safe_float(profile.get("voice_gain"), 1.03), 0.92, 1.18)
+    return f"volume={gain:.4f}"
+
+
+def _loudnorm_filter(mode="short"):
+    if _mode_key(mode) == "long":
+        # Long narration can be slightly softer.
+        return "loudnorm=I=-16:TP=-1.5:LRA=10:linear=true"
+    return "loudnorm=I=-15:TP=-1.5:LRA=9:linear=true"
+
+
+def _build_main_filter(profile, mode="short", apply_tempo=True):
+    filters = []
+
+    if apply_tempo:
+        tempo_filter, tempo_value = _tempo_filter_from_profile(profile, mode=mode)
+        filters.append(tempo_filter)
+    else:
+        tempo_value = 1.0
+
+    filters.append(_eq_filter(profile, mode=mode))
+    filters.append(_compressor_filter(profile, mode=mode))
+    filters.append(_volume_filter(profile))
+    filters.append(_loudnorm_filter(mode=mode))
+
+    return ",".join(filters), tempo_value
+
+
+# ==========================================================
+# OPTIONAL ROOM TONE / BREATH TEXTURE
+# ==========================================================
+
+def _generate_subtle_room_tone(duration, output_path, profile):
+    """
+    Generates very low volume noise texture.
+
+    This is optional and extremely quiet.
+    It helps avoid "digital dead silence" feel, but should not be heard.
+    """
+    duration = max(float(duration or 0), 0.1)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    breath_db = _clamp(_safe_float(profile.get("breath_layer_db"), -38), -55, -26)
+
+    # Convert dB to volume multiplier.
+    # -38 dB is extremely quiet.
+    volume = 10 ** (breath_db / 20.0)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f", "lavfi",
+        "-i", f"anoisesrc=color=pink:duration={duration}:amplitude={volume}",
+        "-ar", "44100",
+        "-ac", "2",
+        str(output_path),
+    ]
+
+    try:
+        _run_ffmpeg(cmd, label="room_tone")
+        return str(output_path)
+    except Exception as e:
+        safe_print(f"[VoiceOrchestrator] Room tone skipped: {e}")
+        return None
+
+
+def _mix_room_tone(voice_path, room_tone_path, output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not room_tone_path or not Path(room_tone_path).exists():
+        return str(voice_path)
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(voice_path),
+        "-i", str(room_tone_path),
+        "-filter_complex",
+        "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=0[aout]",
+        "-map", "[aout]",
+        "-ar", "44100",
+        "-ac", "2",
+        str(output_path),
+    ]
+
+    try:
+        _run_ffmpeg(cmd, label="room_tone_mix")
+        return str(output_path)
+    except Exception as e:
+        safe_print(f"[VoiceOrchestrator] Room tone mix skipped: {e}")
+        return str(voice_path)
+
+
+# ==========================================================
+# MAIN PROCESSOR
+# ==========================================================
+
+def humanize_audio_file(
+    input_audio,
+    output_audio=None,
+    profile=None,
+    mode="short",
+    render_plan=None,
+    content_hint=None,
+    add_room_tone=True,
+    apply_tempo=True,
+):
+    """
+    Main humanization function.
+
+    Args:
+        input_audio:
+            source voice path.
+
+        output_audio:
+            output path. If None, generated automatically.
+
+        profile:
+            resolved voice profile dict.
+
+        mode:
+            short/long.
+
+        render_plan:
+            AI Editing Brain plan.
+
+        content_hint:
+            niche.
+
+        add_room_tone:
+            adds extremely quiet pink-noise texture.
+
+        apply_tempo:
+            applies tiny global tempo adjustment.
+
+    Returns:
+        output path string.
+    """
+    input_audio = Path(input_audio)
+
+    if not input_audio.exists():
+        raise FileNotFoundError(f"Input audio not found: {input_audio}")
+
+    mode = _mode_key(mode)
+    profile = _resolve_profile(profile=profile, content_hint=content_hint, render_plan=render_plan)
+
+    if output_audio is None:
+        output_audio = _output_path(input_audio, mode, profile)
+    else:
+        output_audio = Path(output_audio)
+
+    output_audio.parent.mkdir(parents=True, exist_ok=True)
+
+    temp_master = TEMP_DIR / f"{input_audio.stem}_master_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+
+    filter_chain, tempo_value = _build_main_filter(
+        profile,
+        mode=mode,
+        apply_tempo=apply_tempo,
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(input_audio),
+        "-af", filter_chain,
+        "-ar", "44100",
+        "-ac", "2",
+        str(temp_master),
+    ]
+
+    safe_print(
+        f"[VoiceOrchestrator] Humanizing | mode={mode} | "
+        f"profile={profile.get('name')} | tempo={tempo_value:.5f}"
+    )
+
+    _run_ffmpeg(cmd, label="voice_master")
+
+    final_path = str(temp_master)
+
+    if add_room_tone:
+        duration = get_audio_duration(temp_master)
+        room_tone = _generate_subtle_room_tone(
+            duration=duration,
+            output_path=TEMP_DIR / f"{input_audio.stem}_roomtone.wav",
+            profile=profile,
+        )
+
+        final_path = _mix_room_tone(
+            voice_path=temp_master,
+            room_tone_path=room_tone,
+            output_path=output_audio,
+        )
+    else:
+        # Copy temp master to output path via ffmpeg for format consistency.
+        cmd2 = [
+            "ffmpeg",
+            "-y",
+            "-i", str(temp_master),
+            "-ar", "44100",
+            "-ac", "2",
+            str(output_audio),
+        ]
+        _run_ffmpeg(cmd2, label="voice_output_copy")
+        final_path = str(output_audio)
+
+    entry = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "input_audio": str(input_audio),
+        "output_audio": str(final_path),
+        "mode": mode,
+        "profile": profile.get("name"),
+        "tempo_value": tempo_value,
+        "room_tone": bool(add_room_tone),
+    }
+    _append_log(entry)
+
+    safe_print(f"[VoiceOrchestrator] Humanized voice ready: {final_path}")
+    return str(final_path)
+
+
+# ==========================================================
+# COMPATIBILITY ALIASES
+# ==========================================================
+
+def humanize_voice_file(input_audio, output_audio=None, mode="short", selected_profile=None, content_hint=None):
+    profile = _resolve_profile(profile=None, content_hint=content_hint, render_plan=None)
+    return humanize_audio_file(
+        input_audio=input_audio,
+        output_audio=output_audio,
+        profile=profile,
+        mode=mode,
+        content_hint=content_hint,
+    )
+
+
+def process_voice(input_audio, output_audio=None, mode="short", profile=None):
+    return humanize_audio_file(
+        input_audio=input_audio,
+        output_audio=output_audio,
+        profile=profile,
+        mode=mode,
+    )
+
+
+def orchestrate_voice_humanization(input_audio, output_audio=None, **kwargs):
+    return humanize_audio_file(
+        input_audio=input_audio,
+        output_audio=output_audio,
+        **kwargs,
+    )
+
+
+# ==========================================================
+# BATCH / LOG HELPERS
+# ==========================================================
+
+def humanize_folder(folder_path, mode="short", content_hint=None):
+    folder = Path(folder_path)
+
+    if not folder.exists():
+        return {}
+
+    files = []
+    for ext in (".mp3", ".wav", ".m4a", ".aac"):
+        files.extend(folder.glob(f"*{ext}"))
+
+    results = {}
+    for f in sorted(files):
+        try:
+            results[str(f)] = humanize_audio_file(
+                input_audio=f,
+                output_audio=None,
+                mode=mode,
+                content_hint=content_hint,
+            )
+        except Exception as e:
+            safe_print(f"[VoiceOrchestrator] Failed {f.name}: {e}")
+            results[str(f)] = str(f)
+
+    return results
+
+
+def read_orchestrator_log():
+    if not LOG_FILE.exists():
+        return []
+    try:
+        return json.loads(LOG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+# ==========================================================
+# EXTENDED EXPLANATION NOTES
+# ==========================================================
+# 1. This orchestrator uses FFmpeg because it is stable and fast.
+# 2. It does not create fake loud breathing. Room tone is extremely quiet.
+# 3. It does not aggressively pitch shift. Strong pitch processing can
+#    create metallic artifacts and hurt caption sync.
+# 4. Global tempo adjustment is intentionally tiny.
+# 5. Sentence-level tempo variation is possible but risky for captions.
+# 6. Final video mix should still run audio_engine.py loudnorm to match
+#    final voice + music + SFX loudness.
+# 7. If a voice sounds bad after processing, set add_room_tone=False
+#    or force_fallback in professional_voice_engine.py.
+# 8. Always keep original source voice file untouched.
+# ==========================================================
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python voice_humanization_orchestrator.py voice.mp3")
+    else:
+        print(humanize_audio_file(sys.argv[1]))
+
+# ==========================================================
+# LONG-FORM MAINTENANCE NOTES
+# ==========================================================
+# Voice orchestrator note 001: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 002: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 003: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 004: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 005: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 006: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 007: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 008: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 009: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 010: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 011: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 012: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 013: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 014: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 015: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 016: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 017: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 018: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 019: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 020: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 021: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 022: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 023: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 024: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 025: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 026: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 027: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 028: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 029: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 030: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 031: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 032: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 033: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 034: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 035: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 036: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 037: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 038: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 039: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 040: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 041: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 042: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 043: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 044: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 045: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 046: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 047: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 048: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 049: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 050: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 051: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 052: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 053: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 054: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 055: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 056: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 057: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 058: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 059: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 060: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 061: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 062: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 063: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 064: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 065: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 066: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 067: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 068: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 069: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 070: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 071: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 072: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 073: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 074: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 075: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 076: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 077: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 078: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 079: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 080: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 081: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 082: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 083: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 084: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 085: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 086: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 087: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 088: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 089: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 090: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 091: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 092: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 093: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 094: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 095: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 096: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 097: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 098: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 099: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 100: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 101: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 102: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 103: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 104: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 105: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 106: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 107: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 108: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 109: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 110: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 111: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 112: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 113: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 114: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 115: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 116: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 117: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 118: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 119: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 120: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 121: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 122: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 123: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 124: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 125: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 126: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 127: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 128: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 129: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 130: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 131: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 132: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 133: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 134: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 135: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 136: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 137: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 138: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 139: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 140: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 141: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 142: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 143: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 144: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 145: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 146: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 147: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 148: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 149: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 150: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 151: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 152: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 153: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 154: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 155: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 156: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 157: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 158: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 159: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 160: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 161: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 162: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 163: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 164: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 165: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 166: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 167: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 168: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 169: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 170: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 171: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 172: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 173: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 174: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 175: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 176: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 177: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 178: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 179: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.
+# Voice orchestrator note 180: Prioritize clarity, subtle humanization, stable captions, and original voice preservation over aggressive effects.

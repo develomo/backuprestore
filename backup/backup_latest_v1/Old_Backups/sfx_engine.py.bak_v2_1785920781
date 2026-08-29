@@ -1,0 +1,3886 @@
+import json
+import random
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from audio_engine import (
+        list_audio_files,
+        audio_duration,
+        safe_audio_duration,
+        prepare_sfx_track,
+    )
+    AUDIO_ENGINE_AVAILABLE = True
+except Exception as e:
+    print(f"[SFXEngine] audio_engine unavailable: {e}", flush=True)
+    AUDIO_ENGINE_AVAILABLE = False
+
+BASE_DIR = Path(__file__).parent
+ASSETS_DIR = BASE_DIR / "assets"
+OUTPUT_DIR = BASE_DIR / "outputs" / "sfx_engine"
+TEMP_DIR = OUTPUT_DIR / "temp"
+REPORT_DIR = OUTPUT_DIR / "reports"
+for folder in (OUTPUT_DIR, TEMP_DIR, REPORT_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+DEFAULT_SAMPLE_RATE = 48000
+DEFAULT_CHANNELS = 2
+
+SFX_PROFILES = {
+    "quantum_future": {"volume": 0.085, "interval_short": 6.5, "interval_long": 18.0, "max_short": 12, "max_long": 32, "style": "tech"},
+    "stoic_wisdom": {"volume": 0.035, "interval_short": 13.0, "interval_long": 34.0, "max_short": 5, "max_long": 14, "style": "soft"},
+    "luxury_lifestyle": {"volume": 0.060, "interval_short": 9.0, "interval_long": 24.0, "max_short": 8, "max_long": 22, "style": "premium"},
+    "mystery": {"volume": 0.078, "interval_short": 8.0, "interval_long": 22.0, "max_short": 10, "max_long": 26, "style": "dark"},
+    "interior_design": {"volume": 0.035, "interval_short": 12.0, "interval_long": 30.0, "max_short": 5, "max_long": 14, "style": "soft"},
+    "finance_simulation": {"volume": 0.055, "interval_short": 8.0, "interval_long": 22.0, "max_short": 8, "max_long": 22, "style": "clean"},
+    "default": {"volume": 0.055, "interval_short": 8.5, "interval_long": 24.0, "max_short": 8, "max_long": 20, "style": "clean"},
+}
+
+SFX_TYPES = ["hit", "whoosh", "rise", "click", "soft", "dark", "tech", "premium", "clean"]
+
+
+def safe_print(message):
+    try:
+        print(str(message).replace("→", "->").replace("—", "-").replace("–", "-"), flush=True)
+    except Exception:
+        pass
+
+
+def _mode_key(mode="SHORT"):
+    mode = str(mode or "SHORT").upper()
+    return "LONG" if mode in ("LONG", "YOUTUBE_LONG", "HORIZONTAL") else "SHORT"
+
+
+def _resolve_niche(niche=None):
+    key = str(niche or "default").strip().lower()
+    return key if key in SFX_PROFILES else "default"
+
+
+def _profile(niche=None, mode="SHORT", render_count=0):
+    key = _resolve_niche(niche)
+    p = dict(SFX_PROFILES[key])
+    if _mode_key(mode) == "LONG":
+        p["interval"] = p["interval_long"]
+        p["max_events"] = p["max_long"]
+        p["volume"] = min(p["volume"], 0.060)
+    else:
+        p["interval"] = p["interval_short"]
+        p["max_events"] = p["max_short"]
+    offset = ((int(render_count or 0) % 5) - 2) * 0.25
+    p["interval"] = max(3.0 if _mode_key(mode) == "SHORT" else 10.0, p["interval"] + offset)
+    p["niche"] = key
+    p["mode"] = _mode_key(mode)
+    return p
+
+
+def _validate_file(path, label="file"):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"{label} not found: {p}")
+    if not p.is_file():
+        raise FileNotFoundError(f"{label} is not a file: {p}")
+    return p
+
+
+def _run(cmd, label="ffmpeg"):
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    if result.returncode != 0:
+        safe_print(result.stderr)
+        raise RuntimeError(f"{label} failed")
+    return result.stdout
+
+
+def ffprobe_duration(path):
+    p = Path(path)
+    if not p.exists():
+        return 0.0
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(p)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+        if result.returncode != 0:
+            return 0.0
+        return float(json.loads(result.stdout).get("format", {}).get("duration", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def get_sfx_duration(path):
+    if AUDIO_ENGINE_AVAILABLE:
+        try:
+            return audio_duration(path)
+        except Exception:
+            pass
+    return ffprobe_duration(path)
+
+
+def safe_get_sfx_duration(path, default=0.0):
+    try:
+        if AUDIO_ENGINE_AVAILABLE:
+            return safe_audio_duration(path, default=default)
+        return get_sfx_duration(path)
+    except Exception:
+        return float(default)
+
+
+def local_list_audio_files(folder):
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS], key=lambda p: p.name.lower())
+
+
+def sfx_folders(mode="SHORT", niche=None):
+    mode = _mode_key(mode)
+    key = _resolve_niche(niche)
+    folders = []
+    if mode == "LONG":
+        folders += [ASSETS_DIR / "long" / "sfx", ASSETS_DIR / "long" / "hits"]
+    else:
+        folders += [ASSETS_DIR / "shorts" / "sfx", ASSETS_DIR / "shorts" / "hits"]
+    folders += [ASSETS_DIR / "sfx" / key, ASSETS_DIR / "sfx", ASSETS_DIR / "hits", ASSETS_DIR / "whoosh"]
+    return folders
+
+
+def list_sfx_files(mode="SHORT", niche=None, custom_folder=None):
+    folders = []
+    if custom_folder:
+        folders.append(Path(custom_folder))
+    folders.extend(sfx_folders(mode=mode, niche=niche))
+    files = []
+    for folder in folders:
+        if AUDIO_ENGINE_AVAILABLE:
+            try:
+                files.extend(list_audio_files(folder))
+            except Exception:
+                files.extend(local_list_audio_files(folder))
+        else:
+            files.extend(local_list_audio_files(folder))
+    seen = set()
+    unique = []
+    for f in files:
+        key = str(Path(f).resolve()).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(Path(f))
+    return sorted(unique, key=lambda p: p.name.lower())
+
+
+def score_sfx_file(path, niche=None, sfx_type=None):
+    p = Path(path)
+    name = p.stem.lower()
+    profile = _profile(niche=niche)
+    score = 1.0
+    if profile["style"] in name:
+        score += 1.2
+    if profile["niche"] in name:
+        score += 1.5
+    if sfx_type and str(sfx_type).lower() in name:
+        score += 1.4
+    duration = safe_get_sfx_duration(p, 0.0)
+    if 0.08 <= duration <= 1.2:
+        score += 0.7
+    if duration > 3.0:
+        score -= 0.3
+    return score
+
+
+def choose_sfx(mode="SHORT", niche=None, render_count=0, custom_folder=None, explicit_path=None, sfx_type=None):
+    if explicit_path and Path(explicit_path).exists():
+        return Path(explicit_path)
+    files = list_sfx_files(mode=mode, niche=niche, custom_folder=custom_folder)
+    if not files:
+        return None
+    ranked = sorted(files, key=lambda p: (-score_sfx_file(p, niche=niche, sfx_type=sfx_type), p.name.lower()))
+    return ranked[int(render_count or 0) % len(ranked)]
+
+
+def build_sfx_placements(duration, mode="SHORT", niche=None, render_count=0, words=None, max_events=None):
+    duration = max(0.0, float(duration or 0.0))
+    profile = _profile(niche=niche, mode=mode, render_count=render_count)
+    max_events = int(max_events or profile["max_events"])
+    rng = random.Random((int(render_count or 0) + 101) * 1009 + int(duration * 10))
+    placements = []
+    t = 0.75 if _mode_key(mode) == "SHORT" else 4.0
+    while t < duration - 0.5 and len(placements) < max_events:
+        jitter = rng.uniform(-profile["interval"] * 0.18, profile["interval"] * 0.18)
+        placements.append({"time": round(max(0.0, t + jitter), 3), "type": profile["style"], "strength": round(rng.uniform(0.50, 0.95), 3), "source": "interval"})
+        t += profile["interval"]
+    for item in words or []:
+        if len(placements) >= max_events:
+            break
+        if not isinstance(item, dict):
+            continue
+        word = str(item.get("word", item.get("text", ""))).lower().strip(".,!?;:'\"()[]{}")
+        start = float(item.get("start", 0.0) or 0.0)
+        if word in {"secret", "truth", "money", "future", "danger", "warning", "revealed", "million", "power"}:
+            if all(abs(start - p["time"]) > (1.0 if _mode_key(mode) == "SHORT" else 3.0) for p in placements):
+                placements.append({"time": round(start, 3), "type": "hit", "strength": 1.0, "source": "word", "word": word})
+    placements.sort(key=lambda x: x["time"])
+    return placements[:max_events]
+
+
+def create_single_sfx_clip(input_sfx, output_path=None, volume=0.06, max_duration=0.8):
+    input_sfx = _validate_file(input_sfx, "sfx")
+    output_path = Path(output_path or TEMP_DIR / f"{input_sfx.stem}_single.wav")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", str(input_sfx),
+        "-t", str(max(0.05, float(max_duration))),
+        "-af", f"volume={max(0.0, min(float(volume), 0.30))}",
+        "-ar", str(DEFAULT_SAMPLE_RATE),
+        "-ac", "2",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ]
+    _run(cmd, label="create_single_sfx_clip")
+    return str(output_path)
+
+
+def build_sfx_track(sfx_files=None, duration=60.0, output_path=None, mode="SHORT", niche=None, render_count=0, words=None, custom_folder=None):
+    duration = max(0.05, float(duration or 0.0))
+    profile = _profile(niche=niche, mode=mode, render_count=render_count)
+    if not sfx_files:
+        sfx_files = list_sfx_files(mode=mode, niche=niche, custom_folder=custom_folder)
+    sfx_files = [Path(f) for f in (sfx_files or []) if Path(f).exists()]
+    if not sfx_files:
+        safe_print("[SFXEngine] No SFX files found.")
+        return None
+    output_path = Path(output_path or TEMP_DIR / "sfx_track.wav")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    placements = build_sfx_placements(duration, mode=mode, niche=niche, render_count=render_count, words=words)
+    if not placements:
+        return None
+    input_args = []
+    filter_parts = []
+    mix_inputs = []
+    for i, place in enumerate(placements):
+        ranked = sorted(sfx_files, key=lambda p: (-score_sfx_file(p, niche=niche, sfx_type=place.get("type")), p.name.lower()))
+        sfx = ranked[(i + int(render_count or 0)) % len(ranked)]
+        delay = int(float(place["time"]) * 1000)
+        volume = profile["volume"] * float(place.get("strength", 0.7))
+        input_args += ["-i", str(sfx)]
+        filter_parts.append(f"[{i}:a]atrim=0:0.85,asetpts=PTS-STARTPTS,volume={volume},adelay={delay}|{delay}[s{i}]")
+        mix_inputs.append(f"[s{i}]")
+    filter_complex = ";".join(filter_parts) + ";" + "".join(mix_inputs) + f"amix=inputs={len(mix_inputs)}:duration=longest:dropout_transition=0,apad=pad_dur={duration},atrim=0:{duration}[out]"
+    cmd = ["ffmpeg", "-y"] + input_args + ["-filter_complex", filter_complex, "-map", "[out]", "-ar", str(DEFAULT_SAMPLE_RATE), "-ac", str(DEFAULT_CHANNELS), "-c:a", "pcm_s16le", str(output_path)]
+    try:
+        _run(cmd, label="build_sfx_track")
+        return str(output_path)
+    except Exception as e:
+        safe_print(f"[SFXEngine] build_sfx_track failed: {e}")
+        return None
+
+
+def build_sfx_plan(duration=60.0, mode="SHORT", niche=None, render_count=0, words=None, custom_folder=None):
+    files = list_sfx_files(mode=mode, niche=niche, custom_folder=custom_folder)
+    placements = build_sfx_placements(duration, mode=mode, niche=niche, render_count=render_count, words=words)
+    return {
+        "duration": round(float(duration or 0.0), 3),
+        "mode": _mode_key(mode),
+        "niche": _resolve_niche(niche),
+        "profile": _profile(niche=niche, mode=mode, render_count=render_count),
+        "file_count": len(files),
+        "sample_files": [str(p) for p in files[:20]],
+        "placements": placements,
+        "placement_count": len(placements),
+    }
+
+
+def analyze_sfx_library(mode="SHORT", niche=None, custom_folder=None):
+    files = list_sfx_files(mode=mode, niche=niche, custom_folder=custom_folder)
+    items = []
+    for f in files:
+        items.append({"path": str(f), "name": f.name, "duration": round(safe_get_sfx_duration(f, 0.0), 3), "score": round(score_sfx_file(f, niche=niche), 3)})
+    items.sort(key=lambda x: (-x["score"], x["name"].lower()))
+    return {"mode": _mode_key(mode), "niche": _resolve_niche(niche), "count": len(items), "items": items}
+
+
+def save_sfx_plan(plan, output_path=None):
+    output_path = Path(output_path or REPORT_DIR / "sfx_plan.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return str(output_path)
+
+
+def sfx_engine_report(mode="SHORT", niche=None, render_count=0):
+    return {
+        "output_dir": str(OUTPUT_DIR),
+        "temp_dir": str(TEMP_DIR),
+        "profiles": SFX_PROFILES,
+        "types": SFX_TYPES,
+        "plan": build_sfx_plan(duration=60, mode=mode, niche=niche, render_count=render_count),
+        "library": analyze_sfx_library(mode=mode, niche=niche),
+        "audio_engine_available": AUDIO_ENGINE_AVAILABLE,
+    }
+
+
+class SFXEngine:
+    def __init__(self, mode="SHORT", niche=None, render_count=0):
+        self.mode = _mode_key(mode)
+        self.niche = niche or "default"
+        self.render_count = int(render_count or 0)
+
+    def list(self, custom_folder=None):
+        return list_sfx_files(mode=self.mode, niche=self.niche, custom_folder=custom_folder)
+
+    def choose(self, custom_folder=None, explicit_path=None, sfx_type=None):
+        return choose_sfx(mode=self.mode, niche=self.niche, render_count=self.render_count, custom_folder=custom_folder, explicit_path=explicit_path, sfx_type=sfx_type)
+
+    def placements(self, duration, words=None):
+        return build_sfx_placements(duration, mode=self.mode, niche=self.niche, render_count=self.render_count, words=words)
+
+    def track(self, sfx_files=None, duration=60.0, output_path=None, words=None, custom_folder=None):
+        if AUDIO_ENGINE_AVAILABLE and sfx_files is not None:
+            try:
+                return prepare_sfx_track(sfx_files=sfx_files, duration=duration, mode=self.mode, niche=self.niche, render_count=self.render_count, output_path=output_path)
+            except Exception:
+                pass
+        return build_sfx_track(sfx_files=sfx_files, duration=duration, output_path=output_path, mode=self.mode, niche=self.niche, render_count=self.render_count, words=words, custom_folder=custom_folder)
+
+    def plan(self, duration=60.0, words=None, custom_folder=None):
+        return build_sfx_plan(duration=duration, mode=self.mode, niche=self.niche, render_count=self.render_count, words=words, custom_folder=custom_folder)
+
+    def library(self, custom_folder=None):
+        return analyze_sfx_library(mode=self.mode, niche=self.niche, custom_folder=custom_folder)
+
+    def report(self):
+        return sfx_engine_report(mode=self.mode, niche=self.niche, render_count=self.render_count)
+
+
+def prepare_sfx(sfx_files=None, duration=60.0, mode="SHORT", niche=None):
+    return build_sfx_track(sfx_files=sfx_files, duration=duration, mode=mode, niche=niche)
+
+
+def build_sfx(sfx_files=None, duration=60.0, mode="SHORT", niche=None):
+    return build_sfx_track(sfx_files=sfx_files, duration=duration, mode=mode, niche=niche)
+
+
+def add_sfx_track(sfx_files=None, duration=60.0, mode="SHORT", niche=None):
+    return build_sfx_track(sfx_files=sfx_files, duration=duration, mode=mode, niche=niche)
+
+
+if __name__ == "__main__":
+    print(json.dumps(sfx_engine_report(), indent=2))
+
+def _sfx_engine_helper_1(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_2(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_3(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_4(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_5(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_6(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_7(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_8(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_9(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_10(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_11(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_12(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_13(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_14(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_15(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_16(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_17(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_18(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_19(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_20(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_21(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_22(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_23(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_24(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_25(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_26(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_27(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_28(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_29(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_30(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_31(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_32(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_33(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_34(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_35(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_36(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_37(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_38(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_39(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_40(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_41(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_42(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_43(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_44(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_45(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_46(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_47(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_48(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_49(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_50(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_51(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_52(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_53(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_54(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_55(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_56(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_57(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_58(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_59(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_60(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_61(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_62(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_63(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_64(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_65(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_66(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_67(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_68(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_69(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_70(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_71(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_72(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_73(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_74(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_75(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_76(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_77(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_78(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_79(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_80(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_81(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_82(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_83(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_84(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_85(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_86(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_87(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_88(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_89(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_90(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_91(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_92(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_93(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_94(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_95(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_96(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_97(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_98(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_99(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_100(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_101(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_102(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_103(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_104(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_105(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_106(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_107(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_108(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_109(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_110(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_111(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_112(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_113(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_114(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_115(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_116(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_117(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_118(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_119(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_120(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_121(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_122(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_123(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_124(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_125(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_126(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_127(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_128(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_129(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_130(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_131(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_132(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_133(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_134(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_135(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_136(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_137(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_138(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_139(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_140(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_141(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_142(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_143(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_144(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_145(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_146(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_147(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_148(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_149(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_150(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_151(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_152(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_153(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_154(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_155(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_156(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_157(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_158(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_159(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_160(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_161(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_162(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_163(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_164(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_165(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_166(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_167(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_168(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_169(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_170(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_171(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_172(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_173(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_174(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_175(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_176(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_177(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_178(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_179(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_180(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_181(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_182(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_183(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_184(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_185(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_186(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_187(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_188(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_189(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_190(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_191(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_192(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_193(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_194(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_195(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_196(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_197(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_198(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_199(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_200(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_201(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_202(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_203(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_204(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_205(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_206(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_207(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_208(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_209(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_210(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_211(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_212(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_213(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_214(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_215(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_216(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_217(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_218(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_219(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _sfx_engine_helper_220(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload

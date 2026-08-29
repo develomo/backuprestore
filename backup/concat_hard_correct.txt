@@ -1,0 +1,17 @@
+def concat_files_hard(files, out):
+    out = Path(out)
+    files = [Path(f) for f in files if Path(f).exists()]
+    lf = out.with_suffix(".txt")
+    with lf.open("w", encoding="utf-8") as f:
+        for p in files:
+            fp = str(p.resolve()).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{fp}'\n")
+    try:
+        run_cmd([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lf), "-c", "copy", str(out)])
+    except Exception:
+        run_cmd([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(lf), "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-pix_fmt", "yuv420p", str(out)])
+    try:
+        lf.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return out

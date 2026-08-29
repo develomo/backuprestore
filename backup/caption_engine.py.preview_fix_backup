@@ -1,0 +1,162 @@
+# caption_engine.py
+import os
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+try:
+    from moviepy.editor import ImageSequenceClip, CompositeVideoClip, TextClip, VideoFileClip
+except ImportError:
+    ImageSequenceClip = None
+    CompositeVideoClip = None
+    TextClip = None
+    VideoFileClip = None
+from caption_style_registry import get_style, CAPTION_STYLES
+
+DUMMY_TIMED_TEXT = [
+    {"word": "CREATE", "start": 0.0, "end": 0.8},
+    {"word": "HIGH IMPACT", "start": 0.8, "end": 1.6},
+    {"word": "DYNAMIC CAPTIONS", "start": 1.6, "end": 2.8},
+    {"word": "FOR YOUR SHORT VIDEOS", "start": 2.8, "end": 4.2},
+    {"word": "INSTANTLY", "start": 4.2, "end": 5.4},
+    {"word": "WITH MP4 PREVIEW!", "start": 5.4, "end": 7.0}
+]
+
+def hex_to_rgb(hex_str: str):
+    hex_str = hex_str.lstrip('#')
+    return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+
+def render_caption_frame(text: str, style: dict, width: int = 720, height: int = 1280, highlight_idx: int = 0) -> np.ndarray:
+    """Renders a single frame containing caption styled image."""
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    
+    font_size = style.get("font_size", 50)
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except IOError:
+        font = ImageFont.load_default()
+
+    primary_color = hex_to_rgb(style.get("primary_color", "#FFFFFF"))
+    stroke_color = hex_to_rgb(style.get("stroke_color", "#000000"))
+    stroke_w = style.get("stroke_width", 3)
+    
+    # Calculate Text Bounding Box
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    
+    x = (width - text_w) // 2
+    y = int(height * 0.75)  # Caption placement at 75% height
+    
+    # Background Box Handling
+    if style.get("bg_box", False):
+        pad = 20
+        bg_col = style.get("bg_color", (0, 0, 0, 180))
+        box_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        box_draw = ImageDraw.Draw(box_img)
+        box_draw.rounded_rectangle(
+            [x - pad, y - pad, x + text_w + pad, y + text_h + pad],
+            radius=15,
+            fill=bg_col
+        )
+        img = Image.alpha_composite(img, box_img)
+        draw = ImageDraw.Draw(img)
+
+    # Glow Layer Handling
+    if style.get("glow", False):
+        glow_color = hex_to_rgb(style.get("glow_color", "#00E5FF"))
+        glow_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow_img)
+        for offset in range(1, 8):
+            glow_draw.text((x, y), text, font=font, fill=glow_color + (80,))
+        glow_img = glow_img.filter(ImageFilter.GaussianBlur(radius=8))
+        img = Image.alpha_composite(glow_img, img)
+        draw = ImageDraw.Draw(img)
+
+    # Stroke Text Render
+    draw.text((x, y), text, font=font, fill=primary_color + (255,), stroke_width=stroke_w, stroke_fill=stroke_color)
+    
+    return np.array(img)
+
+def generate_mp4_preview(style_id: str, mode: str = "phrase", output_path: str = "caption_preview.mp4") -> str:
+    """
+    Generates a 6-8 second video preview (.mp4) for the selected caption style & mode.
+    """
+    style = get_style(style_id)
+    fps = 30
+    duration = 7.0
+    width, height = 720, 1280
+    
+    frames = []
+    total_frames = int(fps * duration)
+    
+    # Fixed NumPy Array Initialization
+    bg_base = np.zeros((height, width, 3), dtype=np.uint8)
+    for i in range(height):
+        bg_base[i, :, 0] = int(20 + (i / height) * 30)  # Dark Blueish Background
+        bg_base[i, :, 1] = int(15 + (i / height) * 20)
+        bg_base[i, :, 2] = int(35 + (i / height) * 45)
+
+    for frame_idx in range(total_frames):
+        current_time = frame_idx / fps
+        
+        # Determine active dummy text chunk based on selected mode
+        active_text = ""
+        if mode == "word_by_word":
+            for item in DUMMY_TIMED_TEXT:
+                if item["start"] <= current_time < item["end"]:
+                    words = item["word"].split()
+                    active_text = words[0] if words else ""
+                    break
+        elif mode == "phrase":
+            for item in DUMMY_TIMED_TEXT:
+                if item["start"] <= current_time < item["end"]:
+                    active_text = item["word"]
+                    break
+        else:  # Line mode
+            if current_time < 3.5:
+                active_text = "CREATE HIGH IMPACT DYNAMIC CAPTIONS"
+            else:
+                active_text = "FOR YOUR SHORT VIDEOS INSTANTLY"
+
+        # Copy background
+        frame_img = bg_base.copy()
+        
+        if active_text:
+            caption_rgba = render_caption_frame(active_text, style, width, height)
+            alpha = caption_rgba[:, :, 3] / 255.0
+            for c in range(3):
+                frame_img[:, :, c] = (1.0 - alpha) * frame_img[:, :, c] + alpha * caption_rgba[:, :, c]
+                
+        frames.append(frame_img)
+        
+    clip = ImageSequenceClip(frames, fps=fps)
+    clip.write_videofile(output_path, codec="libx264", audio=False, preset="ultrafast", logger=None)
+    return output_path
+
+def apply_captions_to_video(video_path: str, caption_data: list, style_id: str, mode: str, output_path: str) -> str:
+    """
+    Applies caption overlay directly into Master Pipeline Short Videos.
+    """
+    style = get_style(style_id)
+    video = VideoFileClip(video_path)
+    
+    overlay_frames = []
+    fps = int(video.fps)
+    width, height = video.size
+    
+    for frame_idx in range(int(video.duration * fps)):
+        current_time = frame_idx / fps
+        active_text = ""
+        
+        for item in caption_data:
+            if item['start'] <= current_time <= item['end']:
+                active_text = item['text']
+                break
+                
+        caption_rgba = render_caption_frame(active_text, style, width, height) if active_text else np.zeros((height, width, 4), dtype=np.uint8)
+        overlay_frames.append(caption_rgba)
+        
+    caption_clip = ImageSequenceClip(overlay_frames, fps=fps).set_duration(video.duration)
+    final_video = CompositeVideoClip([video, caption_clip])
+    final_video.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+    return output_path

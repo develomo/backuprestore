@@ -1,0 +1,16 @@
+{
+    "voice_humanization_enabled": true,
+    "voice_profile": "luxury_lifestyle",
+    "voice_strength": "heavy",
+    "apply_to_short": true,
+    "apply_to_long": true,
+    "silence_cleanup": true,
+    "voice_polish": true,
+    "eq_enabled": true,
+    "compression_enabled": true,
+    "deesser_enabled": true,
+    "reverb_enabled": true,
+    "limiter_enabled": true,
+    "loudnorm_enabled": true,
+    "content_hint": ""
+}

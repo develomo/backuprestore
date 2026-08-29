@@ -1,0 +1,98 @@
+# batch_long_renderer.py
+# STABLE LONG RENDERER FIX: no freeze, intro voice delay, outro silent, mid subscribe chromakey.
+# PATCHED by fix_pipeline.py -- see PATCH NOTES below.
+#
+# PATCH NOTES (5 bug fixes, batch_long_renderer.py ONLY):
+#   BUG 1 - Outro looping/audio bleed: outro is now rendered as a SEPARATE
+#           segment from the body. The body (intro+clips) is padded/trimmed
+#           to EXACTLY (total_duration - outro_seconds) first, and the
+#           outro is hard-concatenated on AFTER that -- so it can never
+#           repeat early or land in the wrong place again.
+#   BUG 2 - Watermark not showing: apply_niche_watermark() now accepts
+#           custom_logo_path (UI upload) and opacity, and actually uses
+#           them (previously custom_logo_path/wm_opacity were accepted by
+#           render_long_batch_memory() but never passed down -- they were
+#           silently dropped on the floor).
+#   BUG 3 - Subscribe overlay unreliable: now fires at a RANDOM point
+#           between 8:00-9:00 (only if the video is longer than 9 minutes),
+#           lasts a random 5.0-6.0s, sits bottom-right ABOVE the watermark,
+#           and every skip path now logs a clear reason instead of failing
+#           silently.
+#   BUG 4 - Captions ignored by UI checkbox: this was already correctly
+#           wired (add_captions boolean is respected as-is); hardened with
+#           an explicit skip-log so it's always visible in the console when
+#           captions are off on purpose.
+#   BUG 5 - SFX playing continuously: SFX no longer uses -stream_loop -1
+#           (which played it as a nonstop background bed). It now fires as
+#           short bursts roughly every ~7.5 seconds (matching typical clip
+#           transition rhythm) instead.
+from __future__ import annotations
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import json, re, shutil, subprocess, time, gc, random
+
+VIDEO_EXTS={".mp4",".mov",".mkv",".avi",".webm",".m4v"}
+AUDIO_EXTS={".mp3",".wav",".m4a",".aac",".flac",".ogg"}
+IMAGE_EXTS={".png",".jpg",".jpeg",".webp"}
+DEFAULT_EDIT_QUALITY="480p"; DEFAULT_BATCH_SIZE=8; DEFAULT_FPS=24
+INTRO_SECONDS=2.0; OUTRO_SECONDS=2.0; VOICE_START_OFFSET=2.0
+
+def log(x):
+    try: print(str(x), flush=True)
+    except Exception: pass
+
+def fnum(x,d=0.0):
+    try: return float(x)
+    except Exception: return float(d)
+
+def inum(x,d=0):
+    try: return int(x)
+    except Exception: return int(d)
+
+def natural_key(path):
+    s=Path(path).stem; out=[]; cur=""
+    for ch in s:
+        if ch.isdigit(): cur+=ch
+        else:
+            if cur: out.append((0,int(cur))); cur=""
+            out.append((1,ch.lower()))
+    if cur: out.append((0,int(cur)))
+    return out
+
+def existing_files(items, exts=None):
+    out=[]
+    for item in items or []:
+        try:
+            p=Path(item)
+            if p.exists() and p.is_file() and (exts is None or p.suffix.lower() in exts): out.append(p)
+        except Exception: pass
+    return sorted(out,key=natural_key)
+
+def first_existing(items, exts=None):
+    xs=existing_files(items,exts); return xs[0] if xs else None
+
+def get_ffmpeg():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+FFMPEG=get_ffmpeg()
+FFPROBE=str(Path(FFMPEG).with_name("ffprobe.exe")) if Path(FFMPEG).name.lower()=="ffmpeg.exe" else "ffprobe"
+
+
+def run_cmd(cmd):
+    import subprocess, sys
+    print(f"
+▶ Running: {' '.join(str(x) for x in cmd[:4])}... ", end="", flush=True)
+    try:
+        # Direct console stream to prevent buffering deadlocks
+        res = subprocess.run(cmd, check=True, stdout=None, stderr=None)
+        print("✅ Done", flush=True)
+        return res
+    except subprocess.CalledProcessError as e:
+        print(f"
+❌ Error executing command: {e}", flush=True)
+        raise e
+
+        gc.collect()

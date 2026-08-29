@@ -1,0 +1,253 @@
+# batch_long_renderer.py
+# ADVANCED LONG VIDEO RENDERER - 5 INTELLIGENCE ENGINES
+import os, time, math, json, shutil, subprocess, random
+from pathlib import Path
+
+FFMPEG = "ffmpeg"
+FFPROBE = "ffprobe"
+
+# ENGINE 1: MOTION CANVAS (17 Unique Types)
+MOTION_CANVAS = {
+    "center_push": "zoompan=z='min(zoom+0.0008,1.12)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)",
+    "ken_burns_fast": "zoompan=z='min(zoom+0.0015,1.18)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)",
+    "ken_burns_slow": "zoompan=z='min(zoom+0.0004,1.08)':d=1",
+    "diagonal_top_right": "zoompan=z='1.05':d=1:x='iw-iw/zoom':y='0'",
+    "diagonal_bottom_left": "zoompan=z='1.05':d=1:x='0':y='ih-ih/zoom'",
+    "gentle_float_down": "zoompan=z='1.04':d=1:x='iw/2-(iw/zoom/2)':y='ih-ih/zoom'",
+    "gentle_float_up": "zoompan=z='1.04':d=1:x='iw/2-(iw/zoom/2)':y='0'",
+    "gentle_float_left": "zoompan=z='1.04':d=1:x='0':y='ih/2-(ih/zoom/2)'",
+    "gentle_float_right": "zoompan=z='1.04':d=1:x='iw-iw/zoom':y='ih/2-(ih/zoom/2)'",
+    "static_with_micro": "zoompan=z='min(zoom+0.0003,1.03)':d=1",
+    "center_zoom_pulse": "zoompan=z='1+0.04*sin(2*PI*n/30)':d=1",
+    "diag_top_left": "zoompan=z='1.05':d=1:x='0':y='0'",
+    "diag_bottom_right": "zoompan=z='1.05':d=1:x='iw-iw/zoom':y='ih-ih/zoom'",
+    "slow_pan_left": "zoompan=z=1.05:d=1:x='iw-iw/zoom':y=ih/2-(ih/zoom/2)",
+    "slow_pan_right": "zoompan=z=1.05:d=1:x=0:y=ih/2-(ih/zoom/2)",
+    "slow_zoom_in": "zoompan=z='min(zoom+0.0005,1.10)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)",
+    "slow_zoom_out": "zoompan=z='max(1.0,zoom-0.0005)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)"
+}
+
+# ENGINE 2: TRANSITION TYPES (40+ Varied Transitions)
+TRANSITION_TYPES = ["fade", "wipeleft", "wiperight", "wipeup", "wipedown", "slideleft", "slideright", "slideup", "slidedown", "circlecrop", "rectcrop", "distance", "fadeblack", "fadewhite", "radial", "smoothleft", "smoothright", "smoothup", "smoothdown", "circleopen", "circleclose", "vertopen", "vertclose", "horzopen", "horzclose", "dissolve", "pixelize", "diagtl", "diagtr", "diagbl", "diagbr", "hlslice", "hrslice", "vuslice", "vdslice", "hblur", "fadegrays", "wipetl", "wipetr", "wipebl", "wipebr", "squeezeh", "squeezev"]
+
+# ENGINE 3: COLOR GRADING PROFILES
+COLOR_GRADES = {
+    "luxury": "eq=contrast=1.05:saturation=1.1:brightness=0.01",
+    "mystery": "eq=contrast=1.1:saturation=0.9:brightness=-0.02",
+    "ai": "eq=contrast=1.08:saturation=1.15:brightness=0.02",
+    "finance": "eq=contrast=1.03:saturation=0.95:brightness=0.01",
+    "default": "eq=contrast=1.04:saturation=1.05:brightness=0.0"
+}
+
+def run_cmd(cmd, label="FFmpeg"):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        print(f"\n[ERROR] {label} failed: {r.stderr[-300:]}")
+        raise RuntimeError(r.stderr)
+    return r
+
+def probe_duration(path):
+    try:
+        r = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return max(0.1, float(r.stdout.strip()))
+    except:
+        return 5.0
+
+def get_clip_dna(clip_idx, niche="default"):
+    """ENGINE 5: Anti-Template Logic - Unique DNA for every single clip"""
+    random.seed(clip_idx * 7 + hash(niche))
+    motion_keys = list(MOTION_CANVAS.keys())
+    motion = random.choice(motion_keys)
+    trans = random.choice(TRANSITION_TYPES)
+    
+    # Probabilistic effects (Different for every clip)
+    use_grain = random.random() < 0.3  # 30% chance
+    use_blur = random.random() < 0.2   # 20% chance
+    
+    niche_key = niche if niche in COLOR_GRADES else "default"
+    color_grade = COLOR_GRADES[niche_key]
+    
+    return {
+        "motion": motion,
+        "motion_filter": MOTION_CANVAS[motion],
+        "transition": trans,
+        "color_grade": color_grade,
+        "use_grain": use_grain,
+        "use_blur": use_blur
+    }
+
+def render_clip_with_dna(clip_path, out_path, duration, dna, fps=24):
+    """Renders a single clip with its unique DNA (Motion, Color, Effects)"""
+    vf_parts = ["scale=854:480:force_original_aspect_ratio=increase", "crop=854:480", f"fps={fps}"]
+    
+    # 1. Motion
+    vf_parts.append(dna["motion_filter"])
+    # 2. Color Grading
+    vf_parts.append(dna["color_grade"])
+    # 3. Effects (Grain & Motion Blur)
+    if dna["use_grain"]:
+        vf_parts.append("noise=alls=6:allf=t+u")
+    if dna["use_blur"]:
+        vf_parts.append("tmix=frames=3:weights=1 1 1")
+        
+    vf_parts.append("setsar=1")
+    vf_str = ",".join(vf_parts)
+    
+    cmd = [FFMPEG, "-y", "-i", str(clip_path), "-vf", vf_str, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-an", "-t", str(duration), str(out_path)]
+    run_cmd(cmd, f"Clip Render (Motion: {dna['motion']})")
+
+def concat_with_transitions(clip_list, out_path, niche="default"):
+    """ENGINE 2: Smart Concatenation with varied xfade transitions per clip"""
+    if len(clip_list) == 1:
+        shutil.copy2(clip_list[0], out_path)
+        return
+    
+    inputs = []
+    for c in clip_list:
+        inputs.extend(["-i", str(c)])
+        
+    filters = []
+    for i, c in enumerate(clip_list):
+        filters.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps=24,format=yuv420p[v{i}]")
+        
+    current = "[v0]"
+    elapsed = probe_duration(clip_list[0])
+    
+    for i in range(1, len(clip_list)):
+        dna = get_clip_dna(i, niche) # Get unique transition for this junction
+        trans = dna["transition"]
+        dur = random.uniform(0.3, 0.6) # Random transition duration
+        offset = max(0.05, elapsed - dur)
+        out_label = f"[x{i}]"
+        
+        print(f"  ↳ [TRANSITION] Clip {i} to {i+1}: Applying '{trans}' ({dur:.2f}s)")
+        filters.append(f"{current}[v{i}]xfade=transition={trans}:duration={dur:.3f}:offset={offset:.3f}{out_label}")
+        current = out_label
+        elapsed = elapsed + probe_duration(clip_list[i]) - dur
+        
+    cmd = [FFMPEG, "-y"] + inputs + ["-filter_complex", ";".join(filters), "-map", current, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", str(out_path)]
+    run_cmd(cmd, "Batch Concat with Transitions")
+
+def mux_audio_with_sfx_bursts(video_path, voice_path, out_path, music_path=None, sfx_files=None, total_duration=0.0, intro_sec=1.5, voice_duration=0.0):
+    """ENGINE 4: Audio Mastering with SFX Bursts (Not continuous)"""
+    cmd = [FFMPEG, "-y", "-i", str(video_path), "-i", str(voice_path)]
+    filters = []
+    labels = []
+    idx = 2
+    
+    # 1. Voice Processing
+    filters.append(f"[1:a]volume=1.5,highpass=f=90,lowpass=f=9500,acompressor=threshold=-19dB:ratio=2.5,alimiter=limit=0.97,adelay={int(intro_sec*1000)}|{int(intro_sec*1000)},atrim=0:{intro_sec+voice_duration:.3f},aresample=44100[v]")
+    labels.append("[v]")
+    
+    # 2. Background Music (Looping, Ducking)
+    if music_path and os.path.exists(str(music_path)):
+        cmd.extend(["-stream_loop", "-1", "-i", str(music_path)])
+        filters.append(f"[{idx}:a]volume=0.15,highpass=f=60,lowpass=f=11500,afade=t=in:st={intro_sec:.3f}:d=1.0,afade=t=out:st={max(intro_sec, intro_sec+voice_duration-1.2):.3f}:d=1.2,adelay={int(intro_sec*1000)}|{int(intro_sec*1000)},atrim=0:{intro_sec+voice_duration:.3f},aresample=44100[m]")
+        labels.append("[m]")
+        idx += 1
+        
+    # 3. SFX BURSTS (Every ~7.5 seconds, NOT continuous)
+    if sfx_files and len(sfx_files) > 0:
+        sfx_path = str(sfx_files[0])
+        if os.path.exists(sfx_path):
+            sfx_dur = probe_duration(sfx_path)
+            burst_len = min(sfx_dur, 1.2)
+            body_len = intro_sec + voice_duration
+            burst_interval = 7.5
+            n_bursts = min(40, max(1, int(body_len // burst_interval)))
+            
+            cmd.extend(["-i", sfx_path])
+            src_labels = "".join(f"[sfx_src{i}]" for i in range(n_bursts))
+            filters.append(f"[{idx}:a]volume=0.4,atrim=0:{burst_len:.3f},asetpts=PTS-STARTPTS,highpass=f=80,lowpass=f=13500,asplit={n_bursts}{src_labels}")
+            
+            hit_labels = []
+            for i in range(n_bursts):
+                delay_ms = int((intro_sec + i * burst_interval) * 1000)
+                filters.append(f"[sfx_src{i}]adelay={delay_ms}|{delay_ms}[sfxh{i}]")
+                hit_labels.append(f"[sfxh{i}]")
+                
+            filters.append("".join(hit_labels) + f"amix=inputs={n_bursts}:duration=longest,atrim=0:{intro_sec+voice_duration:.3f},aresample=44100[s]")
+            labels.append("[s]")
+            idx += 1
+            print(f"  ↳ [SFX ENGINE] Applied {n_bursts} short bursts (every ~{burst_interval}s)")
+            
+    # 4. Final Mix
+    filters.append("".join(labels) + f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0.35,alimiter=limit=0.97,loudnorm=I=-14:TP=-1.0:LRA=10,apad[aout]")
+    
+    cmd.extend(["-filter_complex", ";".join(filters), "-map", "0:v:0", "-map", "[aout]", "-t", str(total_duration), "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(out_path)])
+    run_cmd(cmd, "Audio Mastering (Voice + Music + SFX Bursts)")
+
+def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sfx_files=None, intro_path=None, outro_path=None, subscribe_overlay=None, quality="480p", fps=24, batch_size=6, final_quality="480p", add_captions=True, words=None, words_path=None, transcript_text=None, caption_mode="phrase", style_id=None, cleanup=True, preset_overrides=None, custom_logo_path=None, wm_opacity=0.6, niche="default", **kwargs):
+    out_p = Path(output_path)
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir = out_p.parent / f"long_batch_temp_{int(time.time())}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("\n" + "="*70)
+    print("🚀 ADVANCED LONG VIDEO ENGINE (5 INTELLIGENCE MODULES) ACTIVE")
+    print("="*70)
+    
+    voice_dur = probe_duration(voice_path)
+    total_dur = 1.5 + voice_dur + 2.0 # 1.5s intro, 2.0s outro
+    print(f"🎙️ [VOICE]: {voice_dur:.2f}s | Total Target: {total_dur:.2f}s")
+    
+    # 1. INTRO (1.5s)
+    intro_out = temp_dir / "00_intro.mp4"
+    if intro_path and os.path.exists(str(intro_path)):
+        print("🎬 [INTRO]: Processing 1.5s Intro...")
+        run_cmd([FFMPEG, "-y", "-i", str(intro_path), "-t", "1.5", "-c:v", "libx264", "-preset", "ultrafast", "-an", str(intro_out)])
+    else:
+        run_cmd([FFMPEG, "-y", "-f", "lavfi", "-i", "color=c=black:s=854x480:d=1.5", "-c:v", "libx264", "-preset", "ultrafast", "-an", str(intro_out)])
+        
+    # 2. PROCESS CLIPS WITH UNIQUE DNA
+    print("\n🎨 [MOTION & EFFECTS ENGINE]: Processing clips with unique DNA...")
+    rendered_clips = []
+    clip_dur = voice_dur / len(clips)
+    
+    for i, clip in enumerate(clips):
+        dna = get_clip_dna(i, niche)
+        out_clip = temp_dir / f"clip_{i:04d}.mp4"
+        
+        print(f"  ↳ [CLIP {i+1}/{len(clips)}] Motion: '{dna['motion']}' | Color: '{niche}' | Grain: {dna['use_grain']} | Blur: {dna['use_blur']}")
+        render_clip_with_dna(clip, out_clip, clip_dur, dna, fps)
+        rendered_clips.append(out_clip)
+        
+    # 3. CONCATENATE WITH VARIED TRANSITIONS
+    print("\n🔀 [TRANSITION ENGINE]: Concatenating with varied transitions...")
+    body_out = temp_dir / "body.mp4"
+    concat_with_transitions(rendered_clips, body_out, niche)
+    
+    # 4. OUTRO (2.0s Silent)
+    outro_out = temp_dir / "99_outro.mp4"
+    if outro_path and os.path.exists(str(outro_path)):
+        print("🎬 [OUTRO]: Processing 2.0s Silent Outro...")
+        run_cmd([FFMPEG, "-y", "-i", str(outro_path), "-t", "2.0", "-c:v", "libx264", "-preset", "ultrafast", "-an", str(outro_out)])
+    else:
+        run_cmd([FFMPEG, "-y", "-f", "lavfi", "-i", "color=c=black:s=854x480:d=2.0", "-c:v", "libx264", "-preset", "ultrafast", "-an", str(outro_out)])
+        
+    # Combine Intro + Body + Outro
+    print("\n🔗 [ASSEMBLY]: Joining Intro + Body + Outro...")
+    concat_list = temp_dir / "assembly.txt"
+    with open(concat_list, "w", encoding="utf-8") as f:
+        f.write(f"file '{intro_out.resolve()}'\n")
+        f.write(f"file '{body_out.resolve()}'\n")
+        f.write(f"file '{outro_out.resolve()}'\n")
+        
+    assembled_out = temp_dir / "assembled.mp4"
+    run_cmd([FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(assembled_out)])
+    
+    # 5. AUDIO MASTERING (SFX BURSTS, NOT CONTINUOUS)
+    print("\n🎵 [AUDIO ENGINE]: Mixing Voice, Music, and SFX Bursts...")
+    mux_audio_with_sfx_bursts(assembled_out, voice_path, out_p, music_path, sfx_files, total_dur, intro_sec=1.5, voice_duration=voice_dur)
+    
+    # 6. CLEANUP
+    if cleanup:
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+            
+    print("\n" + "="*70)
+    print(f"✅ SUCCESS: Advanced Long Video Rendered -> {out_p}")
+    print("="*70 + "\n")
+    return str(out_p)

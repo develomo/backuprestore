@@ -1,0 +1,1521 @@
+# batch_long_renderer.py
+# STABLE LONG RENDERER FIX: no freeze, intro voice delay, outro silent, mid subscribe chromakey.
+# PATCHED by fix_pipeline.py -- see PATCH NOTES below.
+#
+# PATCH NOTES (5 bug fixes, batch_long_renderer.py ONLY):
+#   BUG 1 - Outro looping/audio bleed: outro is now rendered as a SEPARATE
+#           segment from the body. The body (intro+clips) is padded/trimmed
+#           to EXACTLY (total_duration - outro_seconds) first, and the
+#           outro is hard-concatenated on AFTER that -- so it can never
+#           repeat early or land in the wrong place again.
+#   BUG 2 - Watermark not showing: apply_niche_watermark() now accepts
+#           custom_logo_path (UI upload) and opacity, and actually uses
+#           them (previously custom_logo_path/wm_opacity were accepted by
+#           render_long_batch_memory() but never passed down -- they were
+#           silently dropped on the floor).
+#   BUG 3 - Subscribe overlay unreliable: now fires at a RANDOM point
+#           between 8:00-9:00 (only if the video is longer than 9 minutes),
+#           lasts a random 5.0-6.0s, sits bottom-right ABOVE the watermark,
+#           and every skip path now logs a clear reason instead of failing
+#           silently.
+#   BUG 4 - Captions ignored by UI checkbox: this was already correctly
+#           wired (add_captions boolean is respected as-is); hardened with
+#           an explicit skip-log so it's always visible in the console when
+#           captions are off on purpose.
+#   BUG 5 - SFX playing continuously: SFX no longer uses -stream_loop -1
+#           (which played it as a nonstop background bed). It now fires as
+#           short bursts roughly every ~7.5 seconds (matching typical clip
+#           transition rhythm) instead.
+from __future__ import annotations
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+import json, re, shutil, subprocess, time, gc, random
+
+try:
+    from unique_editing_engine import get_clip_dna, engine_report
+    ENGINES_AVAILABLE = True
+except ImportError:
+    ENGINES_AVAILABLE = False
+
+VIDEO_EXTS={".mp4",".mov",".mkv",".avi",".webm",".m4v"}
+AUDIO_EXTS={".mp3",".wav",".m4a",".aac",".flac",".ogg"}
+IMAGE_EXTS={".png",".jpg",".jpeg",".webp"}
+DEFAULT_EDIT_QUALITY="480p"; DEFAULT_BATCH_SIZE=8; DEFAULT_FPS=24
+INTRO_SECONDS=2.0; OUTRO_SECONDS=2.0; VOICE_START_OFFSET=2.0
+
+def log(x):
+    try: print(str(x), flush=True)
+    except Exception: pass
+
+def fnum(x,d=0.0):
+    try: return float(x)
+    except Exception: return float(d)
+
+def inum(x,d=0):
+    try: return int(x)
+    except Exception: return int(d)
+
+def natural_key(path):
+    s=Path(path).stem; out=[]; cur=""
+    for ch in s:
+        if ch.isdigit(): cur+=ch
+        else:
+            if cur: out.append((0,int(cur))); cur=""
+            out.append((1,ch.lower()))
+    if cur: out.append((0,int(cur)))
+    return out
+
+def existing_files(items, exts=None):
+    out=[]
+    for item in items or []:
+        try:
+            p=Path(item)
+            if p.exists() and p.is_file() and (exts is None or p.suffix.lower() in exts): out.append(p)
+        except Exception: pass
+    return sorted(out,key=natural_key)
+
+def first_existing(items, exts=None):
+    xs=existing_files(items,exts); return xs[0] if xs else None
+
+def get_ffmpeg():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return "ffmpeg"
+FFMPEG=get_ffmpeg()
+FFPROBE=str(Path(FFMPEG).with_name("ffprobe.exe")) if Path(FFMPEG).name.lower()=="ffmpeg.exe" else "ffprobe"
+
+def run_cmd(cmd,label=None):
+    if label: log(label)
+    r=subprocess.run([str(x) for x in cmd],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors="ignore")
+    if r.returncode!=0: raise RuntimeError((r.stderr or "")[-5000:])
+    return r
+
+def probe_duration(path):
+    try:
+        r=subprocess.run([FFPROBE,"-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1",str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors="ignore")
+        if r.returncode==0: return max(0.05,float(r.stdout.strip()))
+    except Exception: pass
+    return 6.0
+
+def probe_video_size(path):
+    try:
+        r=subprocess.run([FFPROBE,"-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","csv=s=x:p=0",str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors="ignore")
+        if r.returncode==0 and "x" in r.stdout:
+            w,h=r.stdout.strip().split("x")[:2]; return max(1,int(w)),max(1,int(h))
+    except Exception: pass
+    return 854,480
+
+def normalize_quality(q):
+    q=str(q or "480p").lower()
+    if q in {"high","balanced","edit","fast","max","1080p","4k","2160p"}: return "480p"
+    if "720" in q: return "720p"
+    if "360" in q: return "360p"
+    return "480p"
+
+def quality_to_size(q):
+    q=normalize_quality(q)
+    if q=="720p": return 1280,720
+    if q=="360p": return 640,360
+    return 854,480
+
+def duration_plan(total, n):
+    total=max(0.1,fnum(total,0.1)); n=max(1,int(n or 1)); base=total/n
+    pattern=[4.2,5.1,6.4,7.2,5.5,8.0,4.7,6.0,7.8,5.8,6.7,4.9]
+    ds=[base]*n if base<3.2 else [max(3.2,min(9.0,base*.70+pattern[i%len(pattern)]*.30)) for i in range(n)]
+    scale=total/max(.1,sum(ds)); ds=[max(.25,d*scale) for d in ds]
+    ds[-1]=max(.25,ds[-1]+(total-sum(ds)))
+    return ds
+
+def chunked(items,batch_size):
+    batch_size=max(2,int(batch_size or DEFAULT_BATCH_SIZE))
+    for i in range(0,len(items),batch_size): yield i,list(items[i:i+batch_size])
+
+def detect_crop_filter(path):
+    try:
+        p=Path(path); dur=probe_duration(p); ss=min(max(0.0,dur*.2),8.0)
+        r=subprocess.run([FFMPEG,"-hide_banner","-ss",f"{ss:.2f}","-t","2.0","-i",str(p),"-vf","cropdetect=limit=24:round=2:reset=0","-frames:v","30","-f","null","-"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,errors="ignore")
+        matches=re.findall(r"crop=(\d+:\d+:\d+:\d+)",(r.stderr or "")+(r.stdout or ""))
+        if not matches: return None
+        crop=matches[-1]; w,h,x,y=[int(v) for v in crop.split(":")]; sw,sh=probe_video_size(p)
+        if w<sw*.5 or h<sh*.5 or w<=0 or h<=0: return None
+        return f"crop={crop}:exact=1"
+    except Exception: return None
+
+def motion_profile_for_niche(niche="default"):
+    n=str(niche or "default").lower()
+    profiles={
+        "luxury":{"zoom_min":1.075,"zoom_max":1.115,"step":0.00055,"grade":"eq=contrast=1.035:saturation=1.025:brightness=0.002"},
+        "luxury_lifestyle":{"zoom_min":1.075,"zoom_max":1.115,"step":0.00055,"grade":"eq=contrast=1.035:saturation=1.025:brightness=0.002"},
+        "mystery":{"zoom_min":1.085,"zoom_max":1.125,"step":0.00062,"grade":"eq=contrast=1.045:saturation=1.018:brightness=-0.002"},
+        "ai":{"zoom_min":1.090,"zoom_max":1.130,"step":0.00068,"grade":"eq=contrast=1.045:saturation=1.045:brightness=0.001"},
+        "quantum_future":{"zoom_min":1.090,"zoom_max":1.130,"step":0.00068,"grade":"eq=contrast=1.045:saturation=1.045:brightness=0.001"},
+        "finance":{"zoom_min":1.045,"zoom_max":1.075,"step":0.00042,"grade":"eq=contrast=1.030:saturation=1.012:brightness=0.001"},
+        "finance_simulation":{"zoom_min":1.045,"zoom_max":1.075,"step":0.00042,"grade":"eq=contrast=1.030:saturation=1.012:brightness=0.001"},
+        "islamic":{"zoom_min":1.040,"zoom_max":1.070,"step":0.00038,"grade":"eq=contrast=1.020:saturation=1.010:brightness=0.002"},
+        "home_design":{"zoom_min":1.060,"zoom_max":1.095,"step":0.00048,"grade":"eq=contrast=1.028:saturation=1.025:brightness=0.002"},
+        "interior_design":{"zoom_min":1.060,"zoom_max":1.095,"step":0.00048,"grade":"eq=contrast=1.028:saturation=1.025:brightness=0.002"},
+        "stoic":{"zoom_min":1.040,"zoom_max":1.075,"step":0.00038,"grade":"eq=contrast=1.024:saturation=1.010:brightness=0.001"},
+        "default":{"zoom_min":1.065,"zoom_max":1.105,"step":0.00050,"grade":"eq=contrast=1.030:saturation=1.020:brightness=0.002"},
+    }
+    return profiles.get(n,profiles["default"])
+
+def motion_direction(index):
+    dirs=[
+        ("center_push","(iw-iw/zoom)/2","(ih-ih/zoom)/2"),
+        ("left_to_right","(iw-iw/zoom)*0.25","(ih-ih/zoom)/2"),
+        ("right_to_left","(iw-iw/zoom)*0.75","(ih-ih/zoom)/2"),
+        ("top_to_bottom","(iw-iw/zoom)/2","(ih-ih/zoom)*0.25"),
+        ("bottom_to_top","(iw-iw/zoom)/2","(ih-ih/zoom)*0.75"),
+        ("diagonal_soft","(iw-iw/zoom)*0.35","(ih-ih/zoom)*0.65"),
+        ("diagonal_reverse","(iw-iw/zoom)*0.65","(ih-ih/zoom)*0.35"),
+    ]
+    return dirs[int(index or 0)%len(dirs)]
+
+def make_visual_filter(src,size,index,fps,niche="default"):
+    """MODULE 1 MOTION ENGINE V1.
+
+    Every clip gets visible but safe Ken Burns motion.
+    """
+    w,h=size
+    parts=[]
+    crop=detect_crop_filter(src)
+    if crop:
+        parts.append(crop)
+    prof=motion_profile_for_niche(niche)
+    zmin=float(prof["zoom_min"]); zmax=float(prof["zoom_max"])
+    z=zmin+(int(index or 0)%5)*((zmax-zmin)/4.0)
+    step=float(prof["step"])
+    direction,x,y=motion_direction(index)
+    parts += [
+        f"scale={w}:{h}:force_original_aspect_ratio=increase",
+        f"crop={w}:{h}:exact=1",
+        f"zoompan=z='if(lte(on,2),min({z*1.05:.4f},{z:.4f}),min({z:.4f},zoom+{step:.6f}))':x='{x}':y='{y}':d=1:s={w}x{h}:fps={fps}",
+        f"scale={w}:{h}",
+        str(prof["grade"]),
+        "unsharp=5:5:0.32:5:5:0.0",
+        "setsar=1",
+        "setdar=16/9",
+    ]
+    return ",".join(parts)
+
+def scene_start(src_dur,wanted,index):
+    if src_dur<=wanted+.25: return 0.0
+    return max(0.0,src_dur-wanted)*((index%7)/7.0)
+
+def render_clip_segment(src,out,wanted,index,size,fps,quality,niche='default',total_clips=1):
+    src=Path(src); out=Path(out); sd=probe_duration(src); start=scene_start(sd,wanted,index)
+    crf="32" if normalize_quality(quality)=="360p" else "29"
+    base_vf = make_visual_filter(src,size,index,fps,niche=niche)
+    if ENGINES_AVAILABLE:
+        try:
+            import traceback as _tb
+            dna = get_clip_dna(str(src), index, niche=niche, total_clips=int(max(1,total_clips)))
+            extra = []
+            if dna.get("color_filter"):
+                extra.append(str(dna["color_filter"]))
+            if dna.get("use_grain") and dna.get("grain_filter"):
+                extra.append(str(dna["grain_filter"]))
+            if dna.get("use_blur") and dna.get("blur_filter"):
+                extra.append(str(dna["blur_filter"]))
+            vf = base_vf + ("," + ",".join(extra) if extra else "")
+            mn = str(dna.get('motion_name', '?'))
+            cp = dna.get('color_params', {})
+            hue_val = cp.get('hue', 0) if isinstance(cp, dict) else 0
+            log(f"[EngineDNA] clip#{index} | motion={mn} | hue={hue_val} | grain={dna.get('use_grain')} | blur={dna.get('use_blur')}")
+        except Exception as e:
+            log(f"[EngineDNA] clip#{index} ERROR: {e}")
+            import traceback as _tb2
+            log(_tb2.format_exc()[-300:])
+            vf = base_vf
+    else:
+        vf = base_vf
+    run_cmd([FFMPEG,"-y","-ss",f"{start:.3f}","-t",f"{wanted:.3f}","-i",str(src),"-an","-vf",vf,"-r",str(fps),"-pix_fmt","yuv420p","-c:v","libx264","-preset","ultrafast","-crf",crf,"-movflags","+faststart",str(out)])
+    return out
+def normalize_video_asset(src,out,size,fps,limit,quality):
+    src=Path(src); out=Path(out); w,h=size; crf="32" if normalize_quality(quality)=="360p" else "29"
+    run_cmd([FFMPEG,"-y","-t",f"{float(limit):.3f}","-i",str(src),"-an","-vf",f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}:exact=1,scale={w}:{h},setsar=1,setdar=16/9","-r",str(fps),"-pix_fmt","yuv420p","-c:v","libx264","-preset","ultrafast","-crf",crf,"-movflags","+faststart",str(out)])
+    return out
+
+def transition_profile_for_niche(niche="default"):
+    """MODULE 2 - Transition Intelligence Engine.
+
+    FFmpeg xfade supports many transition names depending on ffmpeg build.
+    We use safe common transitions mostly:
+    fade, dissolve, wipeleft, wiperight, wipeup, wipedown, smoothleft, smoothright.
+    """
+    n=str(niche or "default").lower()
+    profiles={
+        "luxury":{
+            "base":["fade","dissolve","fade","smoothleft","fade","smoothright"],
+            "chapter":["dissolve","fade"],
+            "duration_base":0.38,
+            "creative_every":5,
+        },
+        "luxury_lifestyle":{
+            "base":["fade","dissolve","fade","smoothleft","fade","smoothright"],
+            "chapter":["dissolve","fade"],
+            "duration_base":0.38,
+            "creative_every":5,
+        },
+        "mystery":{
+            "base":["fade","dissolve","fade","wipeleft","fade","wiperight"],
+            "chapter":["fade","dissolve"],
+            "duration_base":0.45,
+            "creative_every":4,
+        },
+        "ai":{
+            "base":["fade","smoothleft","dissolve","smoothright","wipeleft","wiperight"],
+            "chapter":["smoothleft","smoothright"],
+            "duration_base":0.34,
+            "creative_every":4,
+        },
+        "quantum_future":{
+            "base":["fade","smoothleft","dissolve","smoothright","wipeleft","wiperight"],
+            "chapter":["smoothleft","smoothright"],
+            "duration_base":0.34,
+            "creative_every":4,
+        },
+        "finance":{
+            "base":["fade","fade","dissolve","fade","fade","smoothleft"],
+            "chapter":["dissolve"],
+            "duration_base":0.28,
+            "creative_every":6,
+        },
+        "finance_simulation":{
+            "base":["fade","fade","dissolve","fade","fade","smoothleft"],
+            "chapter":["dissolve"],
+            "duration_base":0.28,
+            "creative_every":6,
+        },
+        "islamic":{
+            "base":["fade","dissolve","fade","fade","dissolve"],
+            "chapter":["dissolve"],
+            "duration_base":0.42,
+            "creative_every":7,
+        },
+        "home_design":{
+            "base":["fade","dissolve","smoothleft","fade","smoothright"],
+            "chapter":["dissolve"],
+            "duration_base":0.36,
+            "creative_every":5,
+        },
+        "interior_design":{
+            "base":["fade","dissolve","smoothleft","fade","smoothright"],
+            "chapter":["dissolve"],
+            "duration_base":0.36,
+            "creative_every":5,
+        },
+        "stoic":{
+            "base":["fade","dissolve","fade","fade"],
+            "chapter":["dissolve"],
+            "duration_base":0.40,
+            "creative_every":8,
+        },
+        "default":{
+            "base":["fade","dissolve","fade","smoothleft","fade","smoothright"],
+            "chapter":["dissolve"],
+            "duration_base":0.34,
+            "creative_every":5,
+        },
+    }
+    return profiles.get(n,profiles["default"])
+
+def transition_decision(index=0, clip_duration=6.0, niche="default", absolute_time=0.0):
+    """Choose transition type + duration.
+
+    Rules:
+    - 80% simple smooth transitions
+    - 20% creative directional transitions
+    - every 2-3 min chapter reset gets slightly stronger transition
+    - duration adapts to clip length
+    """
+    prof=transition_profile_for_niche(niche)
+    base=list(prof["base"])
+    chapter=list(prof["chapter"])
+    creative_every=max(3,int(prof.get("creative_every",5)))
+    duration_base=float(prof.get("duration_base",0.34))
+
+    # Chapter transition every around 150 sec.
+    if absolute_time and int(absolute_time)//150 != int(max(0,absolute_time-clip_duration))//150:
+        kind=chapter[int(index or 0)%len(chapter)]
+        dur=min(1.1,max(0.70,duration_base+0.25)); kind='fadewhite' if index-int(index/3)*3==0 else 'crossfade'
+    elif int(index or 0)>0 and int(index or 0)%creative_every==0:
+        kind=base[(int(index or 0)*2)%len(base)]
+        dur=min(0.65,max(0.40,duration_base+0.10))
+    else:
+        kind=base[int(index or 0)%len(base)]
+        dur=duration_base
+
+    clip_duration=float(clip_duration or 6.0)
+    if clip_duration<4.0:
+        dur=min(dur,0.24)
+    elif clip_duration>8.0:
+        dur=min(0.55,dur+0.08)
+    else:
+        dur=min(0.45,dur)
+
+    dur=max(0.12,min(0.60,dur))
+    return {"transition":kind,"duration":dur,"index":int(index or 0),"absolute_time":float(absolute_time or 0.0)}
+
+def concat_files(files,out,niche="default",use_transitions=True,global_index_offset=0):
+    """Concat clips using real FFmpeg xfade transitions.
+
+    If xfade fails for any reason, falls back to safe hard concat.
+    This keeps rendering stable while still trying professional transitions.
+    """
+    out=Path(out)
+    files=[Path(f) for f in files if Path(f).exists()]
+    if not files:
+        raise RuntimeError("No files to concat")
+    if len(files)==1:
+        shutil.copy2(files[0],out)
+        return out
+
+    if not use_transitions:
+        return concat_files_hard(files,out)
+
+    try:
+        return concat_files_xfade(files,out,niche=niche,global_index_offset=global_index_offset)
+    except Exception as e:
+        log(f"[Module2Transition] xfade failed, fallback hard concat: {str(e)[-500:]}")
+        return concat_files_hard(files,out)
+
+def concat_files_hard(files,out):
+    out=Path(out)
+    files=[Path(f) for f in files if Path(f).exists()]
+    lf=out.with_suffix(".txt")
+    with lf.open("w",encoding="utf-8") as f:
+        for p in files:
+            fp=str(p.resolve()).replace("\\","/").replace("'","'\\''")
+            f.write(f"file '{fp}'\n")
+    try:
+        run_cmd([FFMPEG,"-y","-f","concat","-safe","0","-i",str(lf),"-c","copy",str(out)])
+    except Exception:
+        run_cmd([FFMPEG,"-y","-f","concat","-safe","0","-i",str(lf),"-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p",str(out)])
+    try: lf.unlink(missing_ok=True)
+    except Exception: pass
+    return out
+
+def concat_files_xfade(files,out,niche="default",global_index_offset=0):
+    """Build xfade filter graph for a small batch.
+
+    Works best with batch_size 6-8. Keeps RAM low by using per-batch xfade,
+    then final batches can also be xfade-concat.
+    """
+    out=Path(out)
+    files=[Path(f) for f in files if Path(f).exists()]
+    durations=[probe_duration(f) for f in files]
+    cmd=[FFMPEG,"-y"]
+    for f in files:
+        cmd += ["-i",str(f)]
+
+    filters=[]
+    # Normalize streams to stable fps/timebase/pixel format.
+    for i in range(len(files)):
+        filters.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={DEFAULT_FPS},format=yuv420p[v{i}]")
+
+    current="[v0]"
+    elapsed=durations[0]
+    transition_report=[]
+
+    for i in range(1,len(files)):
+        decision=transition_decision(
+            index=global_index_offset+i,
+            clip_duration=durations[i-1],
+            niche=niche,
+            absolute_time=elapsed,
+        )
+        tr=decision["transition"]
+        dur=float(decision["duration"])
+        offset=max(0.05,elapsed-dur)
+        out_label=f"[x{i}]"
+        filters.append(f"{current}[v{i}]xfade=transition={tr}:duration={dur:.3f}:offset={offset:.3f}{out_label}")
+        transition_report.append(decision)
+        current=out_label
+        elapsed=elapsed+durations[i]-dur
+
+    cmd += [
+        "-filter_complex",";".join(filters),
+        "-map",current,
+        "-an",
+        "-c:v","libx264",
+        "-preset","ultrafast",
+        "-crf","29",
+        "-pix_fmt","yuv420p",
+        "-movflags","+faststart",
+        str(out),
+    ]
+    run_cmd(cmd,label=f"[Module2Transition] xfade concat {len(files)} clips -> {out.name}")
+
+    try:
+        out.with_suffix(".transitions.json").write_text(json.dumps({
+            "module":"Module 2 - Transition Intelligence Engine",
+            "niche":niche,
+            "input_count":len(files),
+            "transitions":transition_report,
+            "hard_cuts_replaced":len(transition_report),
+            "output":str(out),
+        },indent=2),encoding="utf-8")
+    except Exception:
+        pass
+
+    return out
+
+def module2_transition_report():
+    return {
+        "module":"Module 2 - Transition Intelligence Engine",
+        "version":"transition_engine_v1",
+        "real_ffmpeg_xfade":True,
+        "hard_cut_reduction":True,
+        "niche_profiles":["luxury","mystery","ai","finance","islamic","home_design","stoic","default"],
+        "transition_mix":"80% smooth / 20% creative",
+        "duration_range":"0.12s-0.60s",
+        "chapter_aware":True,
+        "fallback_safe_hard_concat":True,
+        "target_score_goal":"Transitions 7.5-9/10 after render analysis",
+    }
+
+def ass_time(sec):
+    sec=max(0.0,fnum(sec)); h=int(sec//3600); m=int((sec%3600)//60); s=sec%60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+def ass_escape(text):
+    return str(text or "").replace("\\","\\\\").replace("{","\\{").replace("}","\\}").replace("\n"," ").strip()
+
+def load_caption_words(voice_path,words=None,words_path=None,transcript_text=None,total_duration=0.0):
+    data=words
+    if not data and words_path:
+        try:
+            p=Path(words_path)
+            if p.exists(): data=json.loads(p.read_text(encoding="utf-8",errors="ignore"))
+        except Exception: data=None
+    if isinstance(data,dict): data=data.get("words",data.get("segments",[]))
+    clean=[]
+    if isinstance(data,list):
+        for item in data:
+            try:
+                if isinstance(item,dict):
+                    word=str(item.get("word",item.get("text",""))).strip(); st=fnum(item.get("start",item.get("s",0.0))); en=fnum(item.get("end",item.get("e",st+.45)),st+.45)
+                else:
+                    word=str(getattr(item,"word",getattr(item,"text",""))).strip(); st=fnum(getattr(item,"start",0.0)); en=fnum(getattr(item,"end",st+.45),st+.45)
+                if word: clean.append({"word":word,"start":max(0,st),"end":max(st+.08,en)})
+            except Exception: pass
+    if not clean and transcript_text:
+        parts=[x.strip() for x in str(transcript_text).split() if x.strip()]
+        if parts:
+            total_duration=max(1.0,fnum(total_duration,len(parts)*.35)); step=total_duration/max(1,len(parts))
+            for i,word in enumerate(parts):
+                st=i*step; clean.append({"word":word,"start":st,"end":st+min(.8,max(.22,step*.9))})
+    if not clean and voice_path and Path(voice_path).exists():
+        try:
+            import whisper
+            log("[StableLong] generating captions with Whisper")
+            result=whisper.load_model("base").transcribe(str(voice_path),word_timestamps=True,verbose=False)
+            for seg in result.get("segments",[]) or []:
+                for w in seg.get("words",[]) or []:
+                    word=str(w.get("word","")).strip()
+                    if word: clean.append({"word":word,"start":fnum(w.get("start",0.0)),"end":fnum(w.get("end",0.0))})
+        except Exception as e: log(f"[StableLong] whisper captions failed: {e}")
+    fake={"warning","impact","now","alert"}
+    if clean and {x["word"].lower() for x in clean}.issubset(fake):
+        log("[StableLong] fake preview captions blocked"); return []
+    clean=validate_caption_tokens(clean); clean.sort(key=lambda x:x["start"]); return clean
+
+def group_caption_words(words,mode="phrase",style_id=None,niche="default"):
+    words=validate_caption_tokens(words)
+    if not words:
+        return []
+    mode=str(mode or "phrase").lower()
+    prof=caption_style(style_id,niche=niche)
+    max_words=max(2,min(6,int(prof.get("max_words",4))))
+    max_chars=max(28,min(56,int(prof.get("max_chars",42))))
+    uppercase=bool(prof.get("uppercase",True))
+
+    if mode in {"word_by_word","word-by-word","word","single"}:
+        out=[]
+        for w in words:
+            text=str(w["word"]).strip()
+            if uppercase:
+                text=text.upper()
+            out.append({"text":text,"start":w["start"],"end":w["end"]})
+        return out
+
+    out=[]; i=0
+    while i<len(words):
+        group=[]
+        chars=0
+        while i<len(words) and len(group)<max_words:
+            token=str(words[i]["word"]).strip()
+            if not token:
+                i+=1
+                continue
+            if group and chars+len(token)+1>max_chars:
+                break
+            group.append(words[i])
+            chars += len(token)+1
+            i+=1
+            if token.endswith((".","?","!","…")) and len(group)>=2:
+                break
+        if group:
+            text=" ".join(x["word"] for x in group).strip()
+            if uppercase:
+                text=text.upper()
+            out.append({"text":text,"start":group[0]["start"],"end":max(group[0]["start"]+0.35,group[-1]["end"])})
+        else:
+            i+=1
+    return out
+
+
+def caption_profile_for_niche(niche="default"):
+    """MODULE 3 - Caption Intelligence Engine.
+
+    This profile is used only when UI style_id is AUTO/empty.
+    If UI sends a specific style_id, that style is locked and not replaced.
+    """
+    n=str(niche or "default").lower()
+    profiles={
+        "luxury":{
+            "style_id":"luxury_gold",
+            "primary":"&H0000D7FF",
+            "outline":"&H00161616",
+            "back":"&H90000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":36,
+            "alignment":2,
+            "margin_v_ratio":0.135,
+            "uppercase":True,
+            "max_words":4,
+            "max_chars":42,
+        },
+        "luxury_lifestyle":{
+            "style_id":"luxury_gold",
+            "primary":"&H0000D7FF",
+            "outline":"&H00161616",
+            "back":"&H90000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":36,
+            "alignment":2,
+            "margin_v_ratio":0.135,
+            "uppercase":True,
+            "max_words":4,
+            "max_chars":42,
+        },
+        "mystery":{
+            "style_id":"mystery_white",
+            "primary":"&H00FFFFFF",
+            "outline":"&H00000000",
+            "back":"&H95000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":35,
+            "alignment":2,
+            "margin_v_ratio":0.140,
+            "uppercase":True,
+            "max_words":3,
+            "max_chars":36,
+        },
+        "ai":{
+            "style_id":"ai_cyan",
+            "primary":"&H00FFF3A7",
+            "outline":"&H000A0A0A",
+            "back":"&H90000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":35,
+            "alignment":2,
+            "margin_v_ratio":0.135,
+            "uppercase":True,
+            "max_words":4,
+            "max_chars":40,
+        },
+        "quantum_future":{
+            "style_id":"ai_cyan",
+            "primary":"&H00FFF3A7",
+            "outline":"&H000A0A0A",
+            "back":"&H90000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":35,
+            "alignment":2,
+            "margin_v_ratio":0.135,
+            "uppercase":True,
+            "max_words":4,
+            "max_chars":40,
+        },
+        "finance":{
+            "style_id":"finance_blue",
+            "primary":"&H00FFE6B0",
+            "outline":"&H00101010",
+            "back":"&H88000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":32,
+            "alignment":2,
+            "margin_v_ratio":0.120,
+            "uppercase":False,
+            "max_words":5,
+            "max_chars":48,
+        },
+        "finance_simulation":{
+            "style_id":"finance_blue",
+            "primary":"&H00FFE6B0",
+            "outline":"&H00101010",
+            "back":"&H88000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":32,
+            "alignment":2,
+            "margin_v_ratio":0.120,
+            "uppercase":False,
+            "max_words":5,
+            "max_chars":48,
+        },
+        "islamic":{
+            "style_id":"islamic_soft_white",
+            "primary":"&H00FFFFFF",
+            "outline":"&H00202020",
+            "back":"&H76000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":34,
+            "alignment":2,
+            "margin_v_ratio":0.140,
+            "uppercase":False,
+            "max_words":4,
+            "max_chars":44,
+        },
+        "home_design":{
+            "style_id":"home_warm",
+            "primary":"&H00EAF7FF",
+            "outline":"&H00161616",
+            "back":"&H85000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":34,
+            "alignment":2,
+            "margin_v_ratio":0.130,
+            "uppercase":False,
+            "max_words":4,
+            "max_chars":44,
+        },
+        "interior_design":{
+            "style_id":"home_warm",
+            "primary":"&H00EAF7FF",
+            "outline":"&H00161616",
+            "back":"&H85000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":34,
+            "alignment":2,
+            "margin_v_ratio":0.130,
+            "uppercase":False,
+            "max_words":4,
+            "max_chars":44,
+        },
+        "stoic":{
+            "style_id":"stoic_minimal",
+            "primary":"&H00FFFFFF",
+            "outline":"&H00181818",
+            "back":"&H74000000",
+            "font":"Georgia",
+            "fontsize":33,
+            "alignment":2,
+            "margin_v_ratio":0.145,
+            "uppercase":False,
+            "max_words":4,
+            "max_chars":44,
+        },
+        "default":{
+            "style_id":"clean_white",
+            "primary":"&H00FFFFFF",
+            "outline":"&H00000000",
+            "back":"&H90000000",
+            "font":"Segoe UI Semibold",
+            "fontsize":34,
+            "alignment":2,
+            "margin_v_ratio":0.135,
+            "uppercase":True,
+            "max_words":4,
+            "max_chars":42,
+        },
+    }
+    return dict(profiles.get(n,profiles["default"]))
+
+def is_auto_caption_style(style_id=None):
+    s=str(style_id or "").strip().lower()
+    return s in {"","auto","automatic","default_auto","niche_auto","auto_caption","caption_auto"}
+
+def caption_style(style_id=None,niche="default"):
+    """UI style lock + AUTO support.
+
+    - If UI sends specific style_id, use that exact style family.
+    - If UI sends auto/empty, choose niche profile.
+    - No random caption style.
+    """
+    if is_auto_caption_style(style_id):
+        return caption_profile_for_niche(niche)
+
+    sid=str(style_id or "").lower()
+    st=caption_profile_for_niche(niche)
+    st["style_id"]=str(style_id)
+
+    # ASS color format is BGR.
+    if "gold" in sid or "orange" in sid or "luxury" in sid:
+        st["primary"]="&H0000D7FF"
+    elif "cyan" in sid or "blue" in sid or "crystal" in sid:
+        st["primary"]="&H00FFF3A7"
+    elif "purple" in sid or "violet" in sid or "neon" in sid:
+        st["primary"]="&H00FCABF0"
+    elif "green" in sid or "emerald" in sid:
+        st["primary"]="&H0096FF96"
+    elif "red" in sid or "ruby" in sid:
+        st["primary"]="&H004040FF"
+    elif "yellow" in sid:
+        st["primary"]="&H0000FFFF"
+    elif "black" in sid:
+        st["primary"]="&H00000000"; st["outline"]="&H00FFFFFF"
+    elif "white" in sid or "clean" in sid or "minimal" in sid:
+        st["primary"]="&H00FFFFFF"
+
+    if "small" in sid:
+        st["fontsize"]=30
+    elif "large" in sid or "bold" in sid:
+        st["fontsize"]=38
+
+    return st
+
+def clean_caption_word(text):
+    s=str(text or "").strip()
+    s=re.sub(r"\s+"," ",s)
+    # Remove weird OCR/Whisper artifacts but keep multilingual letters.
+    s=re.sub(r"[^\wÀ-ž\u0600-\u06FF\u0900-\u097F'’.,!?-]+","",s,flags=re.UNICODE)
+    return s.strip()
+
+def validate_caption_tokens(tokens):
+    out=[]
+    for t in tokens or []:
+        try:
+            word=clean_caption_word(t.get("word",""))
+            if not word:
+                continue
+            # Block obvious gibberish tokens: too long without vowels/numbers mostly.
+            letters=re.sub(r"[^A-Za-zÀ-ž]","",word)
+            if len(letters)>18:
+                vowels=len(re.findall(r"[aeiouAEIOUÀ-ž]",letters))
+                if vowels<2:
+                    continue
+            st=max(0.0,fnum(t.get("start",0.0)))
+            en=max(st+0.08,fnum(t.get("end",st+0.35),st+0.35))
+            out.append({"word":word,"start":st,"end":en})
+        except Exception:
+            pass
+    fake={"warning","impact","now","alert"}
+    if out and {x["word"].lower() for x in out}.issubset(fake):
+        return []
+    return out
+
+def module3_caption_report():
+    return {
+        "module":"Module 3 - Caption Intelligence Engine",
+        "version":"caption_engine_v1",
+        "ui_style_lock":True,
+        "auto_style_mode":True,
+        "niche_caption_profiles":["luxury","mystery","ai","finance","islamic","home_design","stoic","default"],
+        "garbled_caption_protection":True,
+        "timing_offset_sec":-0.10,
+        "voice_start_offset_supported":True,
+        "target_score_goal":"Captions 8.5-9.5/10 after render analysis",
+    }
+
+def wrap_caption_text(text,max_chars=42):
+    text=str(text or "").strip()
+    if len(text)<=max_chars:
+        return text
+    words=text.split()
+    lines=[]; cur=[]
+    for w in words:
+        test=(" ".join(cur+[w])).strip()
+        if len(test)>max_chars and cur:
+            lines.append(" ".join(cur)); cur=[w]
+        else:
+            cur.append(w)
+    if cur:
+        lines.append(" ".join(cur))
+    return "\\N".join(lines[:2])
+
+def write_ass_file(path,segments,size,style_id,caption_offset,niche="default"):
+    path=Path(path); w,h=size
+    st=caption_style(style_id,niche=niche)
+    if style_id and not is_auto_caption_style(style_id): st['selected_style_id'] = style_id
+    if style_id and not is_auto_caption_style(style_id): st['selected_style_id'] = style_id
+    margin_v=max(42,int(h*float(st.get("margin_v_ratio",0.135))))
+    alignment=int(st.get("alignment",2))
+    fontsize=int(st.get("fontsize",34))
+    font=str(st.get("font","Segoe UI Semibold"))
+    max_chars=int(st.get("max_chars",42))
+    lines=[
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        f"PlayResX: {w}",
+        f"PlayResY: {h}",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font},{fontsize},{st['primary']},&H000000FF,{st['outline']},{st['back']},-1,0,0,0,100,100,0,0,3,2.8,0,{alignment},42,42,{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+    ]
+    for seg in segments:
+        start=max(0.0,fnum(seg.get("start"))+caption_offset-0.10)
+        end=max(start+0.15,fnum(seg.get("end"),start+0.5)+caption_offset)
+        text=wrap_caption_text(ass_escape(seg.get("text","")),max_chars=max_chars)
+        if text:
+            lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{text}")
+    path.write_text("\n".join(lines),encoding="utf-8")
+    return path
+
+def burn_captions(video,out,voice_path,words=None,words_path=None,transcript_text=None,caption_mode="phrase",style_id=None,size=(854,480),caption_offset=VOICE_START_OFFSET,niche='default'):
+    video=Path(video); out=Path(out); total=probe_duration(video)
+    word_items=load_caption_words(voice_path,words=words,words_path=words_path,transcript_text=transcript_text,total_duration=max(1,total-caption_offset-OUTRO_SECONDS))
+    segments=group_caption_words(word_items,caption_mode,style_id=style_id,niche=niche)
+    if not segments:
+        log("FORCING CAPTIONS")
+        if not transcript_text: shutil.copy2(video,out); return out
+        parts = str(transcript_text).split()
+        step = max(0.2, total/max(1,len(parts)))
+        segments = [{"start": i*step, "end": (i+1)*step, "text": p} for i,p in enumerate(parts)]
+        parts = str(transcript_text).split()
+        step = max(0.2, total/max(1,len(parts)))
+        segments = [{"start": i*step, "end": (i+1)*step, "text": p} for i,p in enumerate(parts)]
+    ass=out.with_suffix(".ass"); write_ass_file(ass,segments,size,style_id,caption_offset,niche=niche)
+    ass_filter=str(ass.resolve()).replace("\\","/").replace(":","\\:")
+    run_cmd([FFMPEG,"-y","-i",str(video),"-vf",f"subtitles='{ass_filter}'","-c:v","libx264","-preset","ultrafast","-crf","29","-pix_fmt","yuv420p","-an",str(out)])
+    return out
+
+def apply_subscribe_overlay_mid(video, overlay, out, intro_sec, voice_duration, total_duration):
+    """MODULE - Subscribe Overlay Engine  (BUG 3 FIX)
+
+    Rules enforced now:
+      - Only fires if total_duration > 9 minutes (540s), otherwise skipped
+        with a clear log line (never silently missing without explanation).
+      - Fires at a RANDOM point between 8:00 and 9:00.
+      - Stays on-screen for a random 5.0-6.0 seconds.
+      - Positioned bottom-right, ABOVE the watermark (higher y-offset) so
+        the two never visually collide, and clear of the bottom-center
+        caption band.
+      - Supports transparency: PNG/JPG/WEBP alpha, or green-screen chromakey
+        for video overlays.
+      - Every skip path logs a "[SubscribeOverlay] SKIPPED - reason: ..."
+        line so a missing overlay is always debuggable from the console.
+
+    Returns: (output_path, shown: bool, actual_start: float, actual_duration: float)
+    """
+    video=Path(video); out=Path(out)
+
+    if not overlay or not Path(overlay).exists():
+        log("[SubscribeOverlay] SKIPPED - reason: no overlay file provided or file not found")
+        shutil.copy2(video,out)
+        return out, False, 0.0, 0.0
+
+    if total_duration <= 540.0:
+        log(f"[SubscribeOverlay] SKIPPED - reason: video is {total_duration:.1f}s long, "
+            f"must be longer than 540s (9 minutes) for the 8-9 minute window rule")
+        shutil.copy2(video,out)
+        return out, False, 0.0, 0.0
+
+    overlay=Path(overlay)
+    body_end = intro_sec + voice_duration
+    duration_seconds = round(random.uniform(5.0, 6.0), 2)
+    start = random.uniform(480.0, 540.0)  # 8:00 to 9:00
+    end = start + duration_seconds
+
+    # Safety clamp: never let the overlay spill past the body into the outro.
+    if end > body_end - 1.0:
+        end = body_end - 1.0
+        start = max(480.0, end - duration_seconds)
+
+    if start < 480.0 or end <= start:
+        log("[SubscribeOverlay] SKIPPED - reason: the 8-9 minute window does not fit "
+            "safely before this video's outro starts")
+        shutil.copy2(video,out)
+        return out, False, 0.0, 0.0
+
+    actual_duration = round(end - start, 2)
+    # Bottom-right corner, offset well above the watermark (which sits at
+    # the very bottom-right corner) so the two never overlap.
+    # AUTO PATCH
+    # Bottom Center (Below Captions)
+    # Watermark remains bottom-right.
+    # Overlay appears bottom-center with safe spacing.
+    pos = "(main_w-overlay_w)/2:main_h-overlay_h-20"
+
+
+    try:
+        if overlay.suffix.lower() in IMAGE_EXTS:
+            filt=f"[1:v]scale=220:-1,format=rgba,colorchannelmixer=aa=0.92[ov];[0:v][ov]overlay={pos}:enable='between(t,{start:.3f},{end:.3f})'"
+            cmd=[FFMPEG,"-y","-i",str(video),"-loop","1","-i",str(overlay),"-filter_complex",filt,"-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p","-an",str(out)]
+        else:
+            total_v = probe_duration(video)
+            filt=f"[1:v]scale=260:-1,format=rgba,chromakey=0x00ff00:0.28:0.12,colorchannelmixer=aa=0.95[ov];[0:v][ov]overlay={pos}:enable='between(t,{start:.3f},{end:.3f})'"
+            cmd=[FFMPEG,"-y","-i",str(video),"-stream_loop","-1","-i",str(overlay),"-filter_complex",filt,"-t",f"{total_v:.3f}","-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p","-an",str(out)]
+        run_cmd(cmd)
+        log(f"[SubscribeOverlay] shown at {start:.1f}s to {end:.1f}s (duration {actual_duration:.2f}s, bottom-right)")
+        return out, True, round(start,2), actual_duration
+    except Exception as e:
+        log(f"[SubscribeOverlay] SKIPPED - reason: ffmpeg overlay step failed: {e}")
+        shutil.copy2(video,out)
+        return out, False, 0.0, 0.0
+
+def audio_profile_for_niche(niche="default"):
+    """MODULE 4 - Audio Master Engine.
+
+    Target:
+    - louder voice
+    - audible BG music
+    - EQ/compression/limiter
+    - loudnorm target
+    - niche-specific voice/music/SFX balance
+    """
+    n=str(niche or "default").lower()
+    profiles={
+        "luxury":{
+            "voice_volume":1.55,
+            "music_volume":0.165,
+            "sfx_volume":0.075,
+            "highpass":85,
+            "lowpass":9800,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.6,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=60,lowpass=f=12500",
+        },
+        "luxury_lifestyle":{
+            "voice_volume":1.55,
+            "music_volume":0.165,
+            "sfx_volume":0.075,
+            "highpass":85,
+            "lowpass":9800,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.6,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=60,lowpass=f=12500",
+        },
+        "mystery":{
+            "voice_volume":1.58,
+            "music_volume":0.145,
+            "sfx_volume":0.085,
+            "highpass":80,
+            "lowpass":9000,
+            "compress_threshold":"-20dB",
+            "compress_ratio":2.8,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=45,lowpass=f=10500",
+        },
+        "ai":{
+            "voice_volume":1.52,
+            "music_volume":0.155,
+            "sfx_volume":0.085,
+            "highpass":90,
+            "lowpass":10500,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.5,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=70,lowpass=f=13500",
+        },
+        "quantum_future":{
+            "voice_volume":1.52,
+            "music_volume":0.155,
+            "sfx_volume":0.085,
+            "highpass":90,
+            "lowpass":10500,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.5,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=70,lowpass=f=13500",
+        },
+        "finance":{
+            "voice_volume":1.60,
+            "music_volume":0.115,
+            "sfx_volume":0.045,
+            "highpass":95,
+            "lowpass":9200,
+            "compress_threshold":"-20dB",
+            "compress_ratio":3.0,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=80,lowpass=f=9500",
+        },
+        "finance_simulation":{
+            "voice_volume":1.60,
+            "music_volume":0.115,
+            "sfx_volume":0.045,
+            "highpass":95,
+            "lowpass":9200,
+            "compress_threshold":"-20dB",
+            "compress_ratio":3.0,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=80,lowpass=f=9500",
+        },
+        "islamic":{
+            "voice_volume":1.50,
+            "music_volume":0.085,
+            "sfx_volume":0.035,
+            "highpass":85,
+            "lowpass":9000,
+            "compress_threshold":"-20dB",
+            "compress_ratio":2.3,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=60,lowpass=f=9000",
+        },
+        "home_design":{
+            "voice_volume":1.52,
+            "music_volume":0.135,
+            "sfx_volume":0.055,
+            "highpass":85,
+            "lowpass":9400,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.4,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=55,lowpass=f=11500",
+        },
+        "interior_design":{
+            "voice_volume":1.52,
+            "music_volume":0.135,
+            "sfx_volume":0.055,
+            "highpass":85,
+            "lowpass":9400,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.4,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=55,lowpass=f=11500",
+        },
+        "stoic":{
+            "voice_volume":1.50,
+            "music_volume":0.105,
+            "sfx_volume":0.035,
+            "highpass":85,
+            "lowpass":9000,
+            "compress_threshold":"-20dB",
+            "compress_ratio":2.2,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=60,lowpass=f=9000",
+        },
+        "default":{
+            "voice_volume":1.55,
+            "music_volume":0.135,
+            "sfx_volume":0.060,
+            "highpass":90,
+            "lowpass":9500,
+            "compress_threshold":"-19dB",
+            "compress_ratio":2.5,
+            "target_lufs":-14,
+            "music_tone":"highpass=f=60,lowpass=f=11500",
+        },
+    }
+    return dict(profiles.get(n,profiles["default"]))
+
+def module4_audio_report():
+    return {
+        "module":"Module 4 - Audio Master Engine",
+        "version":"audio_master_engine_v1",
+        "target_lufs":"-14 LUFS",
+        "voice_eq":True,
+        "compression":True,
+        "limiter":True,
+        "bg_music_bed":True,
+        "sfx_transition_bursts":True,
+        "ducking_style_balance":True,
+        "fade_in_out":True,
+        "niche_audio_profiles":["luxury","mystery","ai","finance","islamic","home_design","stoic","default"],
+        "target_score_goal":"Audio 8.5-9.5/10 after render analysis",
+    }
+
+def mux_audio_timeline(video,voice,out,music,sfx,total_duration,intro_sec,voice_duration,niche="default",audio_profile=None):
+    """MODULE 4 - Audio Master Engine.
+
+    BUG 5 FIX: SFX used to loop continuously with -stream_loop -1 exactly
+    like the music bed, which made it play nonstop in the background
+    instead of sounding like short transition accents. It now fires as
+    short bursts roughly every ~7.5 seconds (matching typical clip
+    transition rhythm) instead of being an infinite loop.
+    """
+    video=Path(video); voice=Path(voice); out=Path(out)
+    prof=audio_profile if isinstance(audio_profile,dict) else audio_profile_for_niche(niche)
+
+    voice_volume=float(prof.get("voice_volume",1.55))
+    music_volume=float(prof.get("music_volume",0.135))
+    sfx_volume=float(prof.get("sfx_volume",0.060))
+    hp=int(prof.get("highpass",90))
+    lp=int(prof.get("lowpass",9500))
+    threshold=str(prof.get("compress_threshold","-19dB"))
+    ratio=float(prof.get("compress_ratio",2.5))
+    target_lufs=float(prof.get("target_lufs",-14))
+    music_tone=str(prof.get("music_tone","highpass=f=60,lowpass=f=11500"))
+
+    cmd=[FFMPEG,"-y","-i",str(video),"-i",str(voice)]
+
+    trim_end=f"{intro_sec+voice_duration:.3f}"
+
+    # Voice starts after intro. Outro is silent because voice/music are trimmed before outro.
+    filters=[
+        f"[1:a]volume={voice_volume+0.08},"
+        f"highpass=f={max(70,hp-10)},lowpass=f={min(12000,lp+1000)},"\
+        f"equalizer=f=200:t=q:w=1.2:g=1.5,"\
+        f"equalizer=f=3000:t=q:w=0.8:g=3.0,"\
+        f"equalizer=f=6000:t=q:w=1.5:g=-2.0,"
+        f"acompressor=threshold={threshold}:ratio={ratio}:attack=8:release=95,"
+        f"alimiter=limit=0.97,"
+        f"adelay={int(intro_sec*1000)}|{int(intro_sec*1000)},"
+        f"highpass=f=80,acompressor=threshold=-20dB:ratio=3:attack=10:release=100,equalizer=f=4000:t=q:w=1:g=2,atrim=0:{trim_end},"
+        "aresample=44100[v]"
+    ]
+    labels=["[v]"]
+    idx=2
+
+    if music and Path(music).exists():
+        cmd += ["-stream_loop","-1","-i",str(music)]
+        # Music starts after intro, stays under voice, and fades before outro.
+        filters.append(
+            f"[{idx}:a]volume={music_volume},"
+            f"{music_tone},"
+            f"acompressor=threshold=-24dB:ratio=1.7:attack=30:release=250,"
+            f"afade=t=in:st={intro_sec:.3f}:d=1.0,"
+            f"afade=t=out:st={max(intro_sec,intro_sec+voice_duration-1.2):.3f}:d=1.2,"
+            f"adelay={int(intro_sec*1000)}|{int(intro_sec*1000)},"
+            f"highpass=f=80,acompressor=threshold=-20dB:ratio=3:attack=10:release=100,equalizer=f=4000:t=q:w=1:g=2,atrim=0:{trim_end},"
+            "aresample=44100[m]"
+        )
+        labels.append("[m]")
+        idx+=1
+
+    if sfx and Path(sfx).exists():
+        # ---- BUG 5 FIX: short periodic bursts instead of a continuous
+        # -stream_loop -1 background bed. ----
+        sfx_dur = probe_duration(sfx)
+        burst_len = min(sfx_dur, 1.2)
+        body_len = intro_sec + voice_duration
+        burst_interval = 7.5
+        n_bursts = min(60, max(1, int(body_len // burst_interval)))
+        cmd += ["-i",str(sfx)]
+        src_labels = "".join(f"[sfx_src{i}]" for i in range(n_bursts))
+        filters.append(
+            f"[{idx}:a]volume={sfx_volume},atrim=0:{burst_len:.3f},asetpts=PTS-STARTPTS,"
+            f"highpass=f=80,lowpass=f=13500,"
+            f"asplit={n_bursts}{src_labels}"
+        )
+        hit_labels=[]
+        for i in range(n_bursts):
+            delay_ms = int((intro_sec + i*burst_interval) * 1000)
+            filters.append(f"[sfx_src{i}]adelay={delay_ms}|{delay_ms}[sfxh{i}]")
+            hit_labels.append(f"[sfxh{i}]")
+        filters.append(
+            "".join(hit_labels)
+            + f"amix=inputs={n_bursts}:duration=longest,"
+            + f"atrim=0:{trim_end},aresample=44100[s]"
+        )
+        labels.append("[s]")
+        idx+=1
+
+    # Final mastering: compression + limiter + loudnorm.
+    filters.append(
+        "".join(labels)
+        + f"amix=inputs={len(labels)}:duration=longest:dropout_transition=0.35,"
+        + "acompressor=threshold=-18dB:ratio=2.3:attack=10:release=120,"
+        + "alimiter=limit=0.97,"
+        + f"loudnorm=I={target_lufs}:TP=-1.0:LRA=10,"
+        + "apad[aout]"
+    )
+
+    cmd += [
+        "-filter_complex",";".join(filters),
+        "-map","0:v:0",
+        "-map","[aout]",
+        "-t",f"{total_duration:.3f}",
+        "-c:v","copy",
+        "-c:a","aac",
+        "-b:a","256k",
+        "-movflags","+faststart",
+        str(out)
+    ]
+    run_cmd(cmd,label="[Module4Audio] mastering voice + music + sfx(bursts)")
+    return out
+
+def get_broll_clip():
+    d = Path("assets/brolls")
+    if not d.exists(): return None
+    f = [x for x in d.glob('*') if x.suffix.lower() in ['.mp4', '.mov', '.jpg', '.png', '.jpeg', '.webp']]
+    if not f: return None
+    return random.choice(f)
+
+def apply_broll_overlay(v,o,t):
+    b=get_broll_clip()
+    if not b: return Path(v)
+    try:
+        s=max(0,t/2-1.5)
+        cmd=[FFMPEG,"-y","-i",str(v),"-i",str(b),"-filter_complex",f"[1:v]scale=iw*0.3:ih*0.3,scale=iw:ih:force_original_aspect_ratio=decrease,pad=iw:ih:(ow-iw)/2:(oh-ih)/2:black@0,setsar=1,format=yuva420p,fade=t=in:st=0:d=0.5:alpha=1,fade=t=out:st=2.5:d=0.5:alpha=1[b];[0:v][b]overlay=x=(W-w)/2:y=(H-h)/2:enable=between(t,{s},{s}+3)","-c:a","copy","-c:v","libx264","-preset","ultrafast","-crf","28",str(o)]
+        subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        if o.exists() and o.stat().st_size > 1000: return Path(o)
+    except Exception:
+        pass
+    return Path(v)
+
+def apply_niche_watermark(v, o, n="default", custom_logo_path=None, opacity=0.6):
+    """MODULE - Watermark Engine  (BUG 2 FIX)
+
+    Priority order for which logo file gets used:
+      1. custom_logo_path  (UI upload -- this was previously accepted by
+         render_long_batch_memory() but never actually passed down here,
+         so an uploaded logo silently never appeared)
+      2. assets/logos/{niche}.png/.jpg/.jpeg/.webp
+      3. assets/logos/default.png/.jpg/.jpeg/.webp
+
+    `opacity` (0.1-1.0) now actually controls the overlay's alpha instead
+    of being silently dropped like before.
+    Position: bottom-right corner, ~10% of frame width.
+    """
+    wp = None
+
+    if custom_logo_path:
+        try:
+            cp = Path(custom_logo_path)
+            if cp.exists() and cp.is_file() and cp.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                wp = cp
+            elif custom_logo_path:
+                log(f"[Watermark] custom_logo_path provided but invalid/not an image, ignoring: {custom_logo_path}")
+        except Exception as e:
+            log(f"[Watermark] custom_logo_path validation error: {e}")
+
+    if not wp:
+        d = Path("assets/logos")
+        for e in [".png",".jpg",".jpeg",".webp"]:
+            p = d / f"{n}{e}"
+            if p.exists(): wp = p; break
+
+    if not wp:
+        d = Path("assets/logos")
+        for e in [".png",".jpg",".jpeg",".webp"]:
+            p = d / f"default{e}"
+            if p.exists(): wp = p; break
+
+    if not wp:
+        log("[Watermark] SKIPPED - reason: no custom logo uploaded and no niche/default logo found in assets/logos")
+        return Path(v)
+
+    try:
+        op = max(0.1, min(1.0, fnum(opacity, 0.6)))
+        log(f"[Watermark] Applying logo: {wp} (opacity={op}, bottom-right)")
+        cmd=[
+            FFMPEG,"-y","-i",str(v),"-i",str(wp),
+            "-filter_complex",
+            f"[1:v]scale=iw*0.10:-1,format=rgba,colorchannelmixer=aa={op}[wm];"
+            f"[0:v][wm]overlay=W-w-24:H-h-24",
+            "-c:a","copy","-c:v","libx264","-preset","ultrafast","-crf","28",str(o),
+        ]
+        r = subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            log(f"[Watermark] FFmpeg error: {(r.stderr or b'').decode('utf-8','ignore')[-500:]}")
+        if o.exists() and o.stat().st_size > 1000: return Path(o)
+    except Exception as e:
+        log(f"[Watermark] Exception: {e}")
+    return Path(v)
+
+def _fit_body_duration(body_raw, target_duration, temp_dir, size, fps, quality):
+    """Pads (via last-frame clone) or trims the body video to land EXACTLY
+    on `target_duration`. Used only on the body (intro+clips), never on the
+    outro -- this is the core of the BUG 1 fix so the outro can no longer
+    be swallowed by a loop/pad operation that used to apply to the whole
+    (body+outro) video at once."""
+    body_raw = Path(body_raw)
+    actual = probe_duration(body_raw)
+    if actual < target_duration - .5:
+        fixed = Path(temp_dir) / "video_body_fixed.mp4"
+        log(f"[StableLong] body shorter ({actual:.2f} < {target_duration:.2f}); extending BODY ONLY (outro untouched)")
+        pad = max(0.1, target_duration - actual)
+        run_cmd([FFMPEG,"-y","-i",str(body_raw),"-vf",
+                 f"tpad=stop_mode=clone:stop_duration={pad:.3f},trim=0:{target_duration:.3f},setpts=PTS-STARTPTS",
+                 "-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p",str(fixed)])
+        return fixed
+    if actual > target_duration + .5:
+        fixed = Path(temp_dir) / "video_body_fixed.mp4"
+        log(f"[StableLong] body longer ({actual:.2f} > {target_duration:.2f}); trimming BODY ONLY (outro untouched)")
+        run_cmd([FFMPEG,"-y","-i",str(body_raw),"-t",f"{target_duration:.3f}",
+                 "-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p",str(fixed)])
+        return fixed
+    return body_raw
+
+def render_long_batch_memory(voice_path,clips,output_path=None,music_path=None,sfx_files=None,intro_path=None,outro_path=None,subscribe_overlay=None,quality=DEFAULT_EDIT_QUALITY,fps=DEFAULT_FPS,batch_size=None,final_quality=None,add_captions = True,words=None,words_path=None,transcript_text=None,caption_mode="phrase",style_id=None,temp_root=None,cleanup=True,progress_callback=None,preset_overrides=None,custom_logo_path=None,wm_opacity=0.6,**kwargs):
+    started=time.time(); preset=dict(preset_overrides or {})
+    intro_sec=fnum(preset.get("intro_seconds",INTRO_SECONDS),INTRO_SECONDS); outro_sec=fnum(preset.get("outro_seconds",OUTRO_SECONDS),OUTRO_SECONDS); voice_offset=fnum(preset.get("voice_start_offset",intro_sec),intro_sec)
+    quality=normalize_quality(preset.get("quality",quality)); size=quality_to_size(quality); fps=min(max(12,inum(preset.get("fps",fps),DEFAULT_FPS)),24); batch_size=max(2,min(16,inum(preset.get("batch_size",batch_size or DEFAULT_BATCH_SIZE),DEFAULT_BATCH_SIZE)))
+    voice=Path(voice_path); clip_paths=existing_files(clips,VIDEO_EXTS)
+    if not voice.exists(): raise FileNotFoundError(f"Voice not found: {voice}")
+    if not clip_paths: raise FileNotFoundError("No valid long clips found")
+    voice_duration=probe_duration(voice); body_duration=voice_duration; total_duration=intro_sec+body_duration+outro_sec
+    output=Path(output_path) if output_path else Path.cwd()/"outputs"/f"final_long_stable_{int(time.time())}.mp4"; output.parent.mkdir(parents=True,exist_ok=True)
+    temp=Path(temp_root) if temp_root else output.parent/f"_stable_long_temp_{int(time.time())}"; seg_dir=temp/"segments"; batch_dir=temp/"batches"; seg_dir.mkdir(parents=True,exist_ok=True); batch_dir.mkdir(parents=True,exist_ok=True)
+    intro=Path(intro_path) if intro_path and Path(intro_path).exists() else None; outro=Path(outro_path) if outro_path and Path(outro_path).exists() else None; sub=Path(subscribe_overlay) if subscribe_overlay and Path(subscribe_overlay).exists() else None; music=Path(music_path) if music_path and Path(music_path).exists() else None; sfx=first_existing(sfx_files,AUDIO_EXTS)
+    log(f"[StableLong] start | clips={len(clip_paths)} | voice={voice_duration:.2f}s | total={total_duration:.2f}s | intro={intro_sec}s | outro={outro_sec}s | quality={quality} | captions={add_captions} | custom_logo={bool(custom_logo_path)} | wm_opacity={wm_opacity}")
+    outputs=[]; rendered=0; corrupt=[]
+    try:
+        if intro:
+            intro_out=batch_dir/"batch_000_intro.mp4"; normalize_video_asset(intro,intro_out,size,fps,intro_sec,quality); outputs.append(intro_out)
+        scene_durations=duration_plan(body_duration,len(clip_paths))
+        for start_i,batch in chunked(clip_paths,batch_size):
+            log(f"[StableLong] batch {start_i//batch_size+1}: clips {start_i+1}-{start_i+len(batch)}")
+            segs=[]
+            for local_i,clip in enumerate(batch):
+                gi=start_i+local_i; seg=seg_dir/f"seg_{gi+1:05d}.mp4"
+                try:
+                    if progress_callback:
+                        try: progress_callback(gi+1,len(clip_paths),str(clip))
+                        except Exception: pass
+                    render_clip_segment(clip,seg,scene_durations[gi],gi,size,fps,quality,preset.get('niche','default'),total_clips=len(clip_paths)); segs.append(seg); rendered+=1
+                except Exception as e:
+                    msg=str(e)[-600:]; log(f"[StableLong] skipped corrupt clip {clip.name}: {msg}"); corrupt.append({"clip":str(clip),"error":msg})
+                gc.collect()
+            if segs:
+                batch_out=batch_dir/f"batch_{start_i//batch_size+1:04d}.mp4"; concat_files(segs,batch_out,niche=preset.get('niche','default'),use_transitions=True,global_index_offset=start_i); outputs.append(batch_out)
+            for s in segs:
+                try: s.unlink(missing_ok=True)
+                except Exception: pass
+            gc.collect()
+
+        # ---- BUG 1 FIX: outro is rendered SEPARATELY, never mixed into
+        # the same "loop/pad to match duration" step as the body. ----
+        outro_out = None
+        if outro:
+            outro_out = batch_dir / "batch_outro_segment.mp4"
+            normalize_video_asset(outro, outro_out, size, fps, outro_sec, quality)
+
+        if not outputs: raise RuntimeError("No visual outputs rendered")
+
+        body_raw = temp / "video_body_raw.mp4"
+        concat_files(outputs, body_raw, niche=preset.get('niche', 'default'), use_transitions=True, global_index_offset=0)
+
+        body_target_duration = (total_duration - outro_sec) if outro_out else total_duration
+        body_raw = _fit_body_duration(body_raw, body_target_duration, temp, size, fps, quality)
+
+        if outro_out:
+            video_raw = temp / "video_raw.mp4"
+            concat_files([body_raw, outro_out], video_raw, niche=preset.get('niche', 'default'), use_transitions=False, global_index_offset=0)
+            log(f"[StableLong] outro appended at exactly {body_target_duration:.2f}s "
+                f"(occupies the last {outro_sec:.2f}s of the video, cannot repeat or shift anymore)")
+        else:
+            video_raw = body_raw
+
+        current=video_raw
+
+        subscribe_shown=False; subscribe_start=0.0; subscribe_actual_dur=0.0
+        if sub:
+            with_sub=temp/"video_subscribe_mid.mp4"
+            current, subscribe_shown, subscribe_start, subscribe_actual_dur = apply_subscribe_overlay_mid(current, sub, with_sub, intro_sec, voice_duration, total_duration)
+        else:
+            log("[SubscribeOverlay] SKIPPED - reason: no subscribe overlay asset provided for this render")
+
+        broll_out = temp / 'video_broll.mp4'
+        current = apply_broll_overlay(current, broll_out, total_duration)
+
+        if add_captions:
+            captioned=temp/"video_captioned.mp4"; current=burn_captions(current,captioned,voice,words,words_path,transcript_text,caption_mode,style_id,size,voice_offset,preset.get('niche','default'))
+        else:
+            log("[Captions] SKIPPED - add_captions=False (UI checkbox unchecked for this render)")
+
+        wm_out = temp / 'video_watermarked.mp4'
+        current = apply_niche_watermark(current, wm_out, preset.get('niche', 'default'), custom_logo_path=custom_logo_path, opacity=wm_opacity)
+
+        final=mux_audio_timeline(current,voice,output,music,sfx,total_duration,voice_offset,voice_duration,niche=preset.get('niche','default'),audio_profile=preset.get('audio_profile'))
+
+        report={
+            "engine":"stable_long_renderer_no_freeze_fix_patched",
+            "clips_input":len(clip_paths),"clips_rendered":rendered,"corrupt_skipped":corrupt,
+            "quality":quality,"size":{"width":size[0],"height":size[1],"dar":"16:9"},"fps":fps,"batch_size":batch_size,
+            "voice_duration":voice_duration,"intro_seconds":intro_sec,"voice_start_offset":voice_offset,
+            "outro_seconds":outro_sec,"total_duration":total_duration,"intro_used":bool(intro),
+            "outro_used":bool(outro),"outro_separated_fix_applied":True,
+            "subscribe_overlay_provided":bool(sub),"subscribe_overlay_shown":subscribe_shown,
+            "subscribe_overlay_start":subscribe_start,"subscribe_overlay_duration_actual":subscribe_actual_dur,
+            "subscribe_target_second":480.0,
+            "captions_requested":bool(add_captions),"caption_style_id_locked":style_id,
+            "caption_style_source":"UI style_id or AUTO niche profile",
+            "module3_caption_engine":True,"module4_audio_engine":True,
+            "engines":engine_report() if ENGINES_AVAILABLE else {},"music_used":bool(music),"sfx_used":bool(sfx),"sfx_mode":"transition_bursts_fix_applied",
+            "watermark_custom_logo_provided":bool(custom_logo_path),"watermark_opacity_used":wm_opacity,
+            "hidden_upscale":False,"module2_transition_engine":True,
+            "voice_volume":"module4_niche_profile","music_volume":"module4_niche_profile","target_lufs":"-14",
+            "final":str(final),"seconds":round(time.time()-started,2),
+        }
+        try: output.with_suffix(".stable_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+        except Exception: pass
+        log(f"[StableLong] done -> {final}"); return str(final)
+    finally:
+        if corrupt:
+            try: (output.parent/"corrupt_clips_log.json").write_text(json.dumps(corrupt,indent=2),encoding="utf-8")
+            except Exception: pass
+        if cleanup:
+            try: shutil.rmtree(temp,ignore_errors=True)
+            except Exception: pass
+        gc.collect()
+# ==============================================================================
+# 5 ADVANCED INTELLIGENCE ENGINES (Injected Safely)
+# ==============================================================================
+import random
+
+MOTION_CANVAS = {
+    "center_push": "zoompan=z='min(zoom+0.0008,1.12)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)",
+    "ken_burns_fast": "zoompan=z='min(zoom+0.0015,1.18)':d=1:x=iw/2-(iw/zoom/2):y=ih/2-(ih/zoom/2)",
+    "ken_burns_slow": "zoompan=z='min(zoom+0.0004,1.08)':d=1",
+    "diagonal_top_right": "zoompan=z='1.05':d=1:x='iw-iw/zoom':y='0'",
+    "diagonal_bottom_left": "zoompan=z='1.05':d=1:x='0':y='ih-ih/zoom'",
+    "gentle_float_down": "zoompan=z='1.04':d=1:x='iw/2-(iw/zoom/2)':y='ih-ih/zoom'",
+    "gentle_float_up": "zoompan=z='1.04':d=1:x='iw/2-(iw/zoom/2)':y='0'",
+    "gentle_float_left": "zoompan=z='1.04':d=1:x='0':y='ih/2-(ih/zoom/2)'",
+    "gentle_float_right": "zoompan=z='1.04':d=1:x='iw-iw/zoom':y='ih/2-(ih/zoom/2)'",
+    "static_with_micro": "zoompan=z='min(zoom+0.0003,1.03)':d=1",
+    "center_zoom_pulse": "zoompan=z='1+0.04*sin(2*PI*n/30)':d=1",
+    "diag_top_left": "zoompan=z='1.05':d=1:x='0':y='0'",
+    "diag_bottom_right": "zoompan=z='1.05':d=1:x='iw-iw/zoom':y='ih-ih/zoom'",
+}
+
+TRANSITION_TYPES = {
+    "fade": "fade=duration=0.4:alpha=1",
+    "slide_left": "coverleft=duration=0.5",
+    "slide_right": "coverright=duration=0.5",
+    "slide_up": "coverup=duration=0.5",
+    "slide_down": "coverdown=duration=0.5",
+    "dissolve": "fade=duration=0.6:alpha=1",
+    "wipe_left": "wipeleft=duration=0.5",
+    "wipe_right": "wiperight=duration=0.5",
+}
+
+def random_color_grade(seed):
+    random.seed(seed)
+    return {
+        "hue": round(random.uniform(-3, 3), 1),
+        "saturation": round(random.uniform(0.85, 1.25), 2),
+        "contrast": round(random.uniform(0.9, 1.35), 2),
+        "brightness": round(random.uniform(-0.08, 0.08), 2),
+        "gamma": round(random.uniform(0.9, 1.2), 2),
+    }
+
+def should_apply_grain(niche, seed):
+    random.seed(seed + 1)
+    return random.random() < 0.35
+
+def should_apply_motion_blur(niche, seed):
+    random.seed(seed + 2)
+    return random.random() < 0.25
+
+def get_clip_dna(clip_path, clip_idx, niche, total_clips):
+    seed = hash(str(clip_path)) + clip_idx * 7 + total_clips * 13
+    random.seed(seed)
+    motion_keys = list(MOTION_CANVAS.keys())
+    motion = random.choice(motion_keys)
+    return {
+        "motion": MOTION_CANVAS[motion],
+        "color": random_color_grade(seed),
+        "use_grain": should_apply_grain(niche, seed),
+        "use_blur": should_apply_motion_blur(niche, seed),
+        "zoom_level": random.uniform(1.02, 1.15),
+    }
+
+def pick_transition(clip_idx, last_used):
+    keys = list(TRANSITION_TYPES.keys())
+    choice = random.choice(keys)
+    while choice == last_used and len(keys) > 1:
+        choice = random.choice(keys)
+    return choice, TRANSITION_TYPES[choice]

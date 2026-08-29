@@ -1,0 +1,3456 @@
+import json
+import math
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+def _clean_audio_file(audio_path, output_path):
+    """Re-encode audio to clean AAC with consistent parameters to avoid corruption."""
+    from pathlib import Path
+    import subprocess
+    import shutil
+    try:
+        from audio_engine import FFMPEG, run_cmd
+    except:
+        FFMPEG = "ffmpeg"
+        def run_cmd(cmd, label=None):
+            if label: print(label, flush=True)
+            cmd = [str(x) for x in cmd]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or "")[-4500:])
+            return result
+    inp = Path(audio_path)
+    if not inp.exists():
+        raise FileNotFoundError(f"Audio file not found: {inp}")
+    out = Path(output_path) if output_path else inp.with_suffix(".clean.m4a")
+    # Re-encode with consistent parameters
+    cmd = [FFMPEG, "-y", "-i", str(inp), "-ar", "44100", "-ac", "2", "-c:a", "aac", "-b:a", "192k", str(out)]
+    try:
+        run_cmd(cmd, label="[CleanAudio] Re-encoding audio to clean AAC")
+        return str(out)
+    except Exception as e:
+        print(f"[CleanAudio] Re-encode failed: {e}; using original file", flush=True)
+        shutil.copy2(inp, out)
+        return str(out)
+
+
+try:
+    from moviepy.editor import VideoFileClip, AudioFileClip, CompositeAudioClip
+except Exception as e:
+    print(f"[FinalAssembler] MoviePy import failed: {e}", flush=True)
+    VideoFileClip = None
+    AudioFileClip = None
+    CompositeAudioClip = None
+
+try:
+    from voice_duration import get_voice_duration_float, build_export_duration_plan
+except Exception:
+    def get_voice_duration_float(path):
+        return _ffprobe_duration(path)
+    def build_export_duration_plan(voice_path, target_mode=None):
+        d = get_voice_duration_float(voice_path)
+        m = target_mode or ("SHORT" if d <= 90 else "LONG")
+        return {"voice_duration": d, "target_mode": m, "final_duration": min(d, 89.5) if m == "SHORT" else d}
+
+try:
+    from duration_guard import safe_get_duration, trim_media_file, build_duration_report
+except Exception:
+    def safe_get_duration(path, default=0.0):
+        try:
+            return _ffprobe_duration(path)
+        except Exception:
+            return default
+    def trim_media_file(input_path, output_path, duration, copy_streams=True):
+        return ffmpeg_trim(input_path, output_path, duration)
+    def build_duration_report(video_path=None, voice_path=None, audio_path=None):
+        return {
+            "video_duration": safe_get_duration(video_path) if video_path else None,
+            "voice_duration": safe_get_duration(voice_path) if voice_path else None,
+            "audio_duration": safe_get_duration(audio_path) if audio_path else None,
+        }
+
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "outputs"
+FINAL_DIR = OUTPUT_DIR / "final"
+TEMP_DIR = OUTPUT_DIR / "temp_assembly"
+LOG_DIR = OUTPUT_DIR / "logs"
+for d in (OUTPUT_DIR, FINAL_DIR, TEMP_DIR, LOG_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"}
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+SHORT_SIZE = (2160, 3840)
+LONG_SIZE = (3840, 2160)
+EDIT_SHORT_SIZE = (1080, 1920)
+EDIT_LONG_SIZE = (1920, 1080)
+
+
+def safe_print(message):
+    try:
+        print(str(message).replace("→", "->").replace("—", "-").replace("–", "-"), flush=True)
+    except Exception:
+        pass
+
+
+def _p(path):
+    return Path(path)
+
+
+def _validate(path, label="file"):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"{label} not found: {p}")
+    return p
+
+
+def _is_video(path):
+    return Path(path).suffix.lower() in VIDEO_EXTS
+
+
+def _is_audio(path):
+    return Path(path).suffix.lower() in AUDIO_EXTS
+
+
+def _run(cmd, label="ffmpeg"):
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    if result.returncode != 0:
+        safe_print(result.stderr)
+        raise RuntimeError(f"{label} failed")
+    return result.stdout
+
+
+def _ffprobe_duration(path):
+    p = Path(path)
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(p)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+        if result.returncode != 0:
+            return 0.0
+        return float(json.loads(result.stdout).get("format", {}).get("duration", 0.0) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _ffprobe_size(path):
+    p = Path(path)
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(p)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+        if result.returncode != 0:
+            return (0, 0)
+        streams = json.loads(result.stdout).get("streams", [])
+        if not streams:
+            return (0, 0)
+        return int(streams[0].get("width", 0)), int(streams[0].get("height", 0))
+    except Exception:
+        return (0, 0)
+
+
+def _mode_key(mode="SHORT"):
+    mode = str(mode or "SHORT").upper()
+    if mode in ("LONG", "YOUTUBE_LONG", "HORIZONTAL", "16:9"):
+        return "LONG"
+    return "SHORT"
+
+
+def output_size_for_mode(mode="SHORT", final_4k=True):
+    mode = _mode_key(mode)
+    if final_4k:
+        return LONG_SIZE if mode == "LONG" else SHORT_SIZE
+    return EDIT_LONG_SIZE if mode == "LONG" else EDIT_SHORT_SIZE
+
+
+def crf_for_mode(mode="SHORT", quality="high"):
+    quality = str(quality or "high").lower()
+    if quality in ("max", "best", "ultra"):
+        return "16"
+    if quality in ("high", "youtube"):
+        return "18"
+    if quality in ("balanced", "fast"):
+        return "20"
+    return "18"
+
+
+def bitrate_for_mode(mode="SHORT", final_4k=True):
+    mode = _mode_key(mode)
+    if final_4k:
+        return "42M" if mode == "SHORT" else "50M"
+    return "14M" if mode == "SHORT" else "16M"
+
+
+def adaptive_bitrate(duration, mode="SHORT", final_4k=True, complexity="normal"):
+    duration = float(duration or 0)
+    mode = _mode_key(mode)
+    complexity = str(complexity or "normal").lower()
+    base = 42 if mode == "SHORT" and final_4k else 50 if mode == "LONG" and final_4k else 14 if mode == "SHORT" else 16
+    if complexity in ("low", "simple", "calm"):
+        base *= 0.78
+    elif complexity in ("high", "complex", "fast"):
+        base *= 1.18
+    if duration > 600 and mode == "LONG":
+        base *= 0.88
+    return f"{int(max(8, base))}M"
+
+
+def safe_output_name(base="final_video", mode="SHORT", suffix=".mp4"):
+    mode = _mode_key(mode).lower()
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(base))
+    return f"{cleaned}_{mode}{suffix}"
+
+
+def ensure_output_path(output_path=None, base="final_video", mode="SHORT"):
+    if output_path:
+        p = Path(output_path)
+    else:
+        p = FINAL_DIR / safe_output_name(base=base, mode=mode)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def ffmpeg_trim(input_path, output_path, duration):
+    input_path = _validate(input_path, "input")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.05, float(duration or 0))
+    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-t", str(duration), "-c", "copy", str(output_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    if result.returncode != 0:
+        cmd = ["ffmpeg", "-y", "-i", str(input_path), "-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-c:a", "aac", "-b:a", "192k", str(output_path)]
+        _run(cmd, label="ffmpeg_trim_reencode")
+    return str(output_path)
+
+
+def normalize_audio_ffmpeg(input_audio, output_audio=None, duration=None):
+    input_audio = _validate(input_audio, "audio")
+    output_audio = Path(output_audio or TEMP_DIR / f"{input_audio.stem}_norm.wav")
+    output_audio.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-y", "-i", str(input_audio)]
+    if duration is not None:
+        cmd += ["-t", str(float(duration))]
+    cmd += [
+        "-af",
+        "highpass=f=80,lowpass=f=16000,loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-ar", "48000",
+        "-ac", "2",
+        "-c:a", "pcm_s16le" if output_audio.suffix.lower() == ".wav" else "aac",
+        str(output_audio),
+    ]
+    _run(cmd, label="normalize_audio")
+    return str(output_audio)
+
+
+def prepare_voice_audio(voice_path, duration=None, normalize=True):
+    voice_path = _validate(voice_path, "voice")
+    if duration is None:
+        duration = get_voice_duration_float(voice_path)
+    if normalize:
+        return normalize_audio_ffmpeg(voice_path, TEMP_DIR / f"{voice_path.stem}_voice_prepared.wav", duration=duration)
+    out = TEMP_DIR / f"{voice_path.stem}_voice_trimmed{voice_path.suffix}"
+    return ffmpeg_trim(voice_path, out, duration)
+
+
+def prepare_music_audio(music_path, duration, volume=0.045, output_path=None):
+    if not music_path:
+        return None
+    music_path = _validate(music_path, "music")
+    output_path = Path(output_path or TEMP_DIR / f"{music_path.stem}_music_prepared.wav")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration = max(0.05, float(duration or 0))
+    volume = max(0.0, min(float(volume or 0.045), 0.20))
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-stream_loop", "-1",
+        "-i", str(music_path),
+        "-t", str(duration),
+        "-af", f"volume={volume},afade=t=in:st=0:d=0.6,afade=t=out:st={max(0, duration-1.2)}:d=1.2",
+        "-ar", "48000",
+        "-ac", "2",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ]
+    _run(cmd, label="prepare_music")
+    return str(output_path)
+
+
+def mix_audio_tracks(voice_audio, music_audio=None, sfx_audio=None, output_path=None, duration=None):
+    voice_audio = _validate(voice_audio, "voice_audio")
+    output_path = Path(output_path or TEMP_DIR / "mixed_audio.wav")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    inputs = [voice_audio]
+    if music_audio:
+        inputs.append(_validate(music_audio, "music_audio"))
+    if sfx_audio:
+        inputs.append(_validate(sfx_audio, "sfx_audio"))
+    if duration is None:
+        duration = safe_get_duration(voice_audio, 0.0)
+    cmd = ["ffmpeg", "-y"]
+    for inp in inputs:
+        cmd += ["-i", str(inp)]
+    if len(inputs) == 1:
+        cmd += ["-t", str(duration), "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", str(output_path)]
+    else:
+        cmd += [
+            "-filter_complex",
+            f"amix=inputs={len(inputs)}:duration=first:dropout_transition=0,loudnorm=I=-16:TP=-1.5:LRA=11",
+            "-t", str(duration),
+            "-ar", "48000",
+            "-ac", "2",
+            "-c:a", "pcm_s16le",
+            str(output_path),
+        ]
+    _run(cmd, label="mix_audio_tracks")
+    return str(output_path)
+
+
+def scale_video_filter(mode="SHORT", final_4k=True):
+    w, h = output_size_for_mode(mode, final_4k=final_4k)
+    return f"scale={w}:{h}:flags=lanczos"
+
+
+
+
+# ============================================================
+# PATCH 2b: FILM GRAIN FLAG (Surgical Addition)
+# ============================================================
+FILM_GRAIN_ENABLED = True
+FILM_GRAIN_OPACITY = 0.03
+
+def apply_grain_to_final(video_path, output_path=None):
+    import subprocess
+    video_path = Path(video_path)
+    output_path = Path(output_path or video_path.parent / ("grain_" + video_path.name))
+    if not FILM_GRAIN_ENABLED:
+        return str(video_path)
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vf", "noise=alls=6:allf=t+u,format=yuv420p",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "19",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            str(output_path)
+        ]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if output_path.exists() and output_path.stat().st_size > 1000:
+            return str(output_path)
+    except Exception:
+        pass
+    return str(video_path)
+# ============================================================
+
+def mux_video_audio(video_path, audio_path, output_path=None, mode="SHORT", duration=None, final_4k=True, quality="high", fps=30, complexity="normal"):
+    """Robust muxer using absolute imports."""
+    from pathlib import Path
+    import subprocess
+    import shutil
+    # Use absolute import to avoid relative import issues
+    try:
+        from audio_engine import run_cmd, probe_duration, FFMPEG
+    except ImportError:
+        # fallback: define local equivalents
+        def run_cmd(cmd, label=None):
+            if label:
+                print(label, flush=True)
+            cmd = [str(x) for x in cmd]
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or "")[-4500:])
+            return result
+        def probe_duration(path):
+            try:
+                r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
+                if r.returncode == 0:
+                    return max(0.05, float(r.stdout.strip()))
+            except:
+                pass
+            return 6.0
+        FFMPEG = "ffmpeg"
+
+    video = Path(video_path)
+    if not video.exists():
+        raise FileNotFoundError(f"Video file not found: {video}")
+    
+    out = Path(output_path) if output_path else video.with_name(video.stem + "_muxed.mp4")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    
+    audio = Path(audio_path)
+    # Clean audio to avoid corruption
+    clean_audio = _clean_audio_file(audio_path, audio.parent / "clean_audio.m4a")
+    audio = Path(clean_audio)
+    audio_duration = None
+    if audio.exists():
+        try:
+            audio_duration = probe_duration(audio)
+        except Exception:
+            audio_duration = None
+    else:
+        # Audio missing: create silent audio
+        print("[mux] Audio file missing; creating silent audio.", flush=True)
+        silent_audio = out.with_suffix(".silent.m4a")
+        cmd = [FFMPEG, "-y", "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100", "-t", "1", "-c:a", "aac", str(silent_audio)]
+        try:
+            run_cmd(cmd, label="[mux] Create silent audio")
+        except Exception as e:
+            print(f"[mux] Could not create silent audio: {e}; copying video only", flush=True)
+            shutil.copy2(video, out)
+            return str(out)
+        audio = silent_audio
+        audio_duration = 1.0
+    
+    # Determine duration
+    try:
+        video_duration = probe_duration(video)
+    except Exception:
+        video_duration = None
+    
+    if duration is None:
+        duration = video_duration or audio_duration or 30.0
+    else:
+        duration = float(duration)
+    
+    # Build mux command
+    cmd = [FFMPEG, "-y", "-i", str(video), "-i", str(audio)]
+    cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+    cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "160k"]
+    cmd += ["-shortest"]
+    cmd += ["-movflags", "+faststart"]
+    cmd += [str(out)]
+    
+    try:
+        run_cmd(cmd, label="[mux] mux_video_audio")
+    except Exception as e:
+        print(f"[mux] mux failed: {e}; falling back to video-only copy", flush=True)
+        shutil.copy2(video, out)
+    
+    return str(out)
+
+def assemble_final_video(video_path, voice_path, output_path=None, mode=None, music_path=None, sfx_audio=None, normalize_voice=True, final_4k=True, quality="high", fps=30, music_volume=0.045, complexity="normal"):
+    video_path = _validate(video_path, "video")
+    voice_path = _validate(voice_path, "voice")
+    duration_plan = build_export_duration_plan(voice_path, target_mode=mode)
+    resolved_mode = _mode_key(duration_plan.get("target_mode") or mode)
+    final_duration = float(duration_plan.get("final_duration") or duration_plan.get("voice_duration") or get_voice_duration_float(voice_path))
+    prepared_voice = prepare_voice_audio(voice_path, duration=final_duration, normalize=normalize_voice)
+    prepared_music = prepare_music_audio(music_path, final_duration, volume=music_volume) if music_path else None
+    mixed_audio = mix_audio_tracks(prepared_voice, music_audio=prepared_music, sfx_audio=sfx_audio, duration=final_duration)
+    output_path = ensure_output_path(output_path, base="FINAL_VIDEO", mode=resolved_mode)
+    final_path = mux_video_audio(video_path, mixed_audio, output_path=output_path, mode=resolved_mode, duration=final_duration, final_4k=final_4k, quality=quality, fps=fps, complexity=complexity)
+    report = build_final_report(video_path=video_path, voice_path=voice_path, audio_path=mixed_audio, output_path=final_path, mode=resolved_mode, duration=final_duration)
+    save_final_report(report)
+    return final_path
+
+
+def build_final_report(video_path=None, voice_path=None, audio_path=None, output_path=None, mode="SHORT", duration=None):
+    report = {
+        "mode": _mode_key(mode),
+        "target_duration": round(float(duration or 0), 3),
+        "video_path": str(video_path) if video_path else None,
+        "voice_path": str(voice_path) if voice_path else None,
+        "audio_path": str(audio_path) if audio_path else None,
+        "output_path": str(output_path) if output_path else None,
+    }
+    for key in ("video_path", "voice_path", "audio_path", "output_path"):
+        if report.get(key):
+            report[key.replace("_path", "_duration")] = round(safe_get_duration(report[key], 0.0), 3)
+    if output_path:
+        w, h = _ffprobe_size(output_path)
+        report["output_width"] = w
+        report["output_height"] = h
+    if report.get("output_duration") and duration:
+        report["duration_difference"] = round(report["output_duration"] - float(duration), 3)
+        report["duration_ok"] = abs(report["duration_difference"]) <= 0.40
+    return report
+
+
+def save_final_report(report, output_path=None):
+    path = Path(output_path or LOG_DIR / "final_assembly_report.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return str(path)
+
+
+def copy_final_to_named_output(final_path, name):
+    final_path = _validate(final_path, "final")
+    name = str(name or "final_video.mp4")
+    if not name.lower().endswith(".mp4"):
+        name += ".mp4"
+    dst = FINAL_DIR / name
+    shutil.copy2(final_path, dst)
+    return str(dst)
+
+
+def validate_final_output(final_path, voice_path=None, tolerance=0.50):
+    final_path = _validate(final_path, "final")
+    final_duration = safe_get_duration(final_path, 0.0)
+    report = {"final_path": str(final_path), "final_duration": round(final_duration, 3), "exists": final_path.exists(), "size_bytes": final_path.stat().st_size}
+    if voice_path:
+        voice_duration = get_voice_duration_float(voice_path)
+        report["voice_path"] = str(voice_path)
+        report["voice_duration"] = round(voice_duration, 3)
+        report["difference"] = round(final_duration - voice_duration, 3)
+        report["duration_ok"] = abs(final_duration - voice_duration) <= float(tolerance)
+    w, h = _ffprobe_size(final_path)
+    report["width"] = w
+    report["height"] = h
+    report["video_ok"] = w > 0 and h > 0 and final_duration > 0
+    return report
+
+
+def assemble_with_existing_audio(video_path, audio_path, output_path=None, mode="SHORT", final_4k=True, quality="high", fps=30):
+    duration = min(safe_get_duration(video_path, 0.0), safe_get_duration(audio_path, 0.0))
+    return mux_video_audio(video_path, audio_path, output_path=output_path, mode=mode, duration=duration, final_4k=final_4k, quality=quality, fps=fps)
+
+
+def trim_final_to_voice(final_path, voice_path, output_path=None):
+    duration = get_voice_duration_float(voice_path)
+    output_path = Path(output_path or FINAL_DIR / f"{Path(final_path).stem}_trimmed.mp4")
+    return ffmpeg_trim(final_path, output_path, duration)
+
+
+def final_assembler_report():
+    return {
+        "output_dir": str(OUTPUT_DIR),
+        "final_dir": str(FINAL_DIR),
+        "temp_dir": str(TEMP_DIR),
+        "log_dir": str(LOG_DIR),
+        "short_size": SHORT_SIZE,
+        "long_size": LONG_SIZE,
+        "moviepy_available": VideoFileClip is not None,
+        "video_exts": sorted(list(VIDEO_EXTS)),
+        "audio_exts": sorted(list(AUDIO_EXTS)),
+    }
+
+
+class FinalAssembler:
+    def __init__(self, mode=None, final_4k=True, quality="high", fps=30):
+        self.mode = mode
+        self.final_4k = final_4k
+        self.quality = quality
+        self.fps = fps
+
+    def assemble(self, video_path, voice_path, output_path=None, music_path=None, sfx_audio=None, music_volume=0.045, complexity="normal"):
+        return assemble_final_video(
+            video_path=video_path,
+            voice_path=voice_path,
+            output_path=output_path,
+            mode=self.mode,
+            music_path=music_path,
+            sfx_audio=sfx_audio,
+            final_4k=self.final_4k,
+            quality=self.quality,
+            fps=self.fps,
+            music_volume=music_volume,
+            complexity=complexity,
+        )
+
+    def mux(self, video_path, audio_path, output_path=None, duration=None):
+        mode = self.mode or ("SHORT" if safe_get_duration(audio_path, 0.0) <= 90 else "LONG")
+        return mux_video_audio(video_path, audio_path, output_path=output_path, mode=mode, duration=duration, final_4k=self.final_4k, quality=self.quality, fps=self.fps)
+
+    def validate(self, final_path, voice_path=None):
+        return validate_final_output(final_path, voice_path=voice_path)
+
+    def report(self):
+        return final_assembler_report()
+
+
+def final_assemble(video_path, voice_path, output_path=None, mode=None):
+    return assemble_final_video(video_path, voice_path, output_path=output_path, mode=mode)
+
+
+def assemble(video_path, voice_path, output_path=None, mode=None):
+    return assemble_final_video(video_path, voice_path, output_path=output_path, mode=mode)
+
+
+def mux(video_path, audio_path, output_path=None, mode="SHORT"):
+    return assemble_with_existing_audio(video_path, audio_path, output_path=output_path, mode=mode)
+
+
+def export_final(video_path, voice_path, output_path=None, mode=None):
+    return assemble_final_video(video_path, voice_path, output_path=output_path, mode=mode)
+
+
+if __name__ == "__main__":
+    print(json.dumps(final_assembler_report(), indent=2))
+
+def _final_assembler_helper_1(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_2(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_3(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_4(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_5(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_6(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_7(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_8(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_9(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_10(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_11(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_12(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_13(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_14(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_15(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_16(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_17(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_18(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_19(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_20(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_21(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_22(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_23(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_24(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_25(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_26(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_27(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_28(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_29(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_30(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_31(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_32(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_33(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_34(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_35(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_36(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_37(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_38(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_39(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_40(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_41(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_42(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_43(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_44(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_45(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_46(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_47(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_48(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_49(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_50(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_51(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_52(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_53(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_54(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_55(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_56(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_57(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_58(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_59(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_60(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_61(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_62(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_63(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_64(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_65(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_66(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_67(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_68(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_69(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_70(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_71(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_72(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_73(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_74(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_75(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_76(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_77(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_78(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_79(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_80(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_81(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_82(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_83(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_84(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_85(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_86(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_87(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_88(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_89(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_90(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_91(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_92(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_93(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_94(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_95(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_96(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_97(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_98(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_99(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_100(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_101(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_102(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_103(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_104(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_105(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_106(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_107(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_108(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_109(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_110(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_111(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_112(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_113(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_114(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_115(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_116(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_117(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_118(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_119(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_120(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_121(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_122(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_123(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_124(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_125(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_126(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_127(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_128(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_129(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_130(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_131(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_132(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_133(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_134(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_135(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_136(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_137(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_138(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_139(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_140(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_141(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_142(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_143(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_144(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_145(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_146(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_147(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_148(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_149(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_150(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_151(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_152(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_153(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_154(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_155(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_156(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_157(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_158(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_159(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_160(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_161(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_162(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_163(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_164(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_165(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_166(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_167(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_168(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_169(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_170(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_171(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_172(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_173(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_174(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_175(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_176(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_177(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_178(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_179(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _final_assembler_helper_180(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload

@@ -1,0 +1,3865 @@
+import json
+import math
+import random
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from moviepy.editor import CompositeVideoClip, vfx
+except Exception as e:
+    print(f"[KeywordZoomEngine] MoviePy import failed: {e}", flush=True)
+    CompositeVideoClip = None
+    vfx = None
+
+try:
+    from zoom_engine import apply_keyword_zoom as _zoom_engine_apply_keyword_zoom
+    from zoom_engine import build_keyword_zoom_plan as _zoom_engine_build_keyword_zoom_plan
+    ZOOM_ENGINE_AVAILABLE = True
+except Exception:
+    _zoom_engine_apply_keyword_zoom = None
+    _zoom_engine_build_keyword_zoom_plan = None
+    ZOOM_ENGINE_AVAILABLE = False
+
+BASE_DIR = Path(__file__).parent
+OUTPUT_DIR = BASE_DIR / "outputs" / "keyword_zoom_engine"
+REPORT_DIR = OUTPUT_DIR / "reports"
+for folder in (OUTPUT_DIR, REPORT_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
+
+GLOBAL_KEYWORDS = {
+    "secret", "truth", "money", "future", "power", "never", "first", "hidden",
+    "danger", "warning", "mistake", "rich", "wealth", "success", "ai",
+    "technology", "mystery", "revealed", "changed", "everything", "impossible",
+    "nobody", "exclusive", "million", "billion", "fear", "mindset",
+    "discipline", "transformation", "luxury", "income", "profit", "wisdom",
+    "control", "freedom", "business", "robot", "machine", "unknown",
+}
+
+NICHE_KEYWORDS = {
+    "quantum_future": {"ai", "future", "technology", "robot", "machine", "scientists", "breakthrough", "automation"},
+    "stoic_wisdom": {"wisdom", "mind", "discipline", "control", "fear", "peace", "silence", "strength"},
+    "luxury_lifestyle": {"luxury", "wealth", "rich", "elite", "exclusive", "status", "million", "private"},
+    "mystery": {"secret", "hidden", "truth", "mystery", "unknown", "warning", "missing", "revealed"},
+    "interior_design": {"room", "home", "design", "before", "after", "transformation", "lighting", "space"},
+    "finance_simulation": {"money", "invest", "income", "asset", "profit", "wealth", "cashflow", "business"},
+    "default": set(),
+}
+
+ZOOM_STYLE_PROFILES = {
+    "quantum_future": {"amount": 0.080, "duration": 0.34, "cooldown_short": 0.85, "cooldown_long": 2.8, "max_short": 16, "max_long": 28},
+    "stoic_wisdom": {"amount": 0.034, "duration": 0.48, "cooldown_short": 1.6, "cooldown_long": 4.5, "max_short": 9, "max_long": 18},
+    "luxury_lifestyle": {"amount": 0.052, "duration": 0.42, "cooldown_short": 1.1, "cooldown_long": 3.4, "max_short": 12, "max_long": 22},
+    "mystery": {"amount": 0.064, "duration": 0.46, "cooldown_short": 1.0, "cooldown_long": 3.2, "max_short": 13, "max_long": 24},
+    "interior_design": {"amount": 0.032, "duration": 0.50, "cooldown_short": 1.6, "cooldown_long": 4.0, "max_short": 8, "max_long": 16},
+    "finance_simulation": {"amount": 0.046, "duration": 0.36, "cooldown_short": 1.0, "cooldown_long": 3.0, "max_short": 12, "max_long": 24},
+    "default": {"amount": 0.045, "duration": 0.38, "cooldown_short": 1.1, "cooldown_long": 3.4, "max_short": 12, "max_long": 22},
+}
+
+
+def safe_print(message):
+    try:
+        print(str(message).replace("→", "->").replace("—", "-").replace("–", "-"), flush=True)
+    except Exception:
+        pass
+
+
+def _mode_key(mode="SHORT"):
+    mode = str(mode or "SHORT").upper()
+    return "LONG" if mode in ("LONG", "YOUTUBE_LONG", "HORIZONTAL") else "SHORT"
+
+
+def _resolve_niche(niche=None):
+    key = str(niche or "default").strip().lower()
+    return key if key in ZOOM_STYLE_PROFILES else "default"
+
+
+def _keywords(niche=None):
+    key = _resolve_niche(niche)
+    return set(GLOBAL_KEYWORDS) | set(NICHE_KEYWORDS.get(key, set()))
+
+
+def _profile(niche=None, mode="SHORT", render_count=0):
+    key = _resolve_niche(niche)
+    profile = dict(ZOOM_STYLE_PROFILES[key])
+    offset = ((int(render_count or 0) % 5) - 2) * 0.002
+    if _mode_key(mode) == "LONG":
+        profile["amount"] = min(0.045, profile["amount"] + offset)
+        profile["cooldown"] = profile["cooldown_long"]
+        profile["max_events"] = profile["max_long"]
+    else:
+        profile["amount"] = min(0.090, profile["amount"] + offset)
+        profile["cooldown"] = profile["cooldown_short"]
+        profile["max_events"] = profile["max_short"]
+    profile["niche"] = key
+    profile["mode"] = _mode_key(mode)
+    return profile
+
+
+def clip_duration(clip):
+    try:
+        return max(float(clip.duration), 0.05)
+    except Exception:
+        return 0.05
+
+
+def clip_size(clip):
+    try:
+        return tuple(clip.size)
+    except Exception:
+        return (1080, 1920)
+
+
+def clamp(value, low, high):
+    return max(low, min(high, float(value)))
+
+
+def ease_out(t):
+    t = clamp(t, 0.0, 1.0)
+    return 1 - (1 - t) ** 3
+
+
+def ease_in_out(t):
+    t = clamp(t, 0.0, 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def normalize_word(word):
+    return str(word or "").strip().lower().strip(".,!?;:'\"()[]{}")
+
+
+def is_keyword(word, niche=None):
+    w = normalize_word(word)
+    if not w:
+        return False
+    keys = _keywords(niche)
+    return w in keys or any(k in w for k in keys if len(k) >= 5)
+
+
+def word_score(word, niche=None):
+    w = normalize_word(word)
+    score = 1.0
+    if len(w) >= 7:
+        score += 0.25
+    if w in GLOBAL_KEYWORDS:
+        score += 0.75
+    if w in NICHE_KEYWORDS.get(_resolve_niche(niche), set()):
+        score += 0.85
+    if w.isdigit():
+        score += 0.45
+    return score
+
+
+def normalize_words(words):
+    output = []
+    for i, item in enumerate(words or []):
+        if isinstance(item, dict):
+            word = item.get("word", item.get("text", ""))
+            start = float(item.get("start", i * 0.35) or 0.0)
+            end = float(item.get("end", start + 0.24) or (start + 0.24))
+        else:
+            word = str(item)
+            start = i * 0.35
+            end = start + 0.24
+        word = str(word).strip()
+        if word:
+            output.append({"word": word, "start": max(0.0, start), "end": max(end, start + 0.05), "score": word_score(word)})
+    output.sort(key=lambda x: x["start"])
+    return output
+
+
+def build_keyword_zoom_plan(words, duration=None, niche=None, mode="SHORT", render_count=0, max_events=None, cooldown=None):
+    if ZOOM_ENGINE_AVAILABLE and _zoom_engine_build_keyword_zoom_plan is not None:
+        try:
+            return _zoom_engine_build_keyword_zoom_plan(words, duration=duration, niche=niche, mode=mode, max_events=max_events or 12)
+        except Exception:
+            pass
+    profile = _profile(niche=niche, mode=mode, render_count=render_count)
+    duration = float(duration or 0.0)
+    max_events = int(max_events or profile["max_events"])
+    cooldown = float(cooldown or profile["cooldown"])
+    tokens = normalize_words(words)
+    if duration <= 0 and tokens:
+        duration = tokens[-1]["end"]
+    events = []
+    last = -999.0
+    ranked_candidates = []
+    for token in tokens:
+        if not is_keyword(token["word"], niche=niche):
+            continue
+        if duration and token["start"] > duration:
+            continue
+        ranked_candidates.append(token)
+    ranked_candidates.sort(key=lambda x: (-x["score"], x["start"]))
+    chosen = []
+    for token in ranked_candidates:
+        start = token["start"]
+        if any(abs(start - c["start"]) < cooldown for c in chosen):
+            continue
+        chosen.append(token)
+        if len(chosen) >= max_events:
+            break
+    chosen.sort(key=lambda x: x["start"])
+    for token in chosen:
+        start = max(0.0, token["start"] - 0.06)
+        event_duration = float(profile["duration"])
+        end = min(duration or token["end"] + event_duration, max(token["end"] + 0.12, start + event_duration))
+        strength = clamp(token["score"] / 3.0, 0.45, 1.25)
+        events.append({
+            "word": token["word"],
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
+            "amount": round(float(profile["amount"]) * strength, 4),
+            "score": round(token["score"], 3),
+            "strength": round(strength, 3),
+        })
+    return events
+
+
+def dynamic_scale_at_time(t, events):
+    scale = 1.0
+    for ev in events or []:
+        start = float(ev.get("start", 0.0))
+        end = float(ev.get("end", start + 0.30))
+        amount = float(ev.get("amount", 0.04))
+        if start <= t <= end:
+            p = (t - start) / max(0.01, end - start)
+            pulse = math.sin(math.pi * p)
+            scale += amount * pulse
+    return scale
+
+
+def apply_keyword_zoom_events(video, events):
+    if video is None or not events:
+        return video
+    if vfx is None:
+        return video
+    duration = clip_duration(video)
+    size = clip_size(video)
+    def scale(t):
+        return dynamic_scale_at_time(t, events)
+    try:
+        out = video.fx(vfx.resize, scale)
+        try:
+            out = out.crop(x_center=out.w / 2, y_center=out.h / 2, width=size[0], height=size[1])
+        except Exception:
+            pass
+        return out.set_duration(duration)
+    except Exception:
+        return video
+
+
+def apply_keyword_zoom_overlay_method(video, events):
+    if video is None or not events or CompositeVideoClip is None:
+        return video
+    duration = clip_duration(video)
+    size = clip_size(video)
+    layers = [video]
+    for ev in events:
+        start = float(ev.get("start", 0.0))
+        end = float(ev.get("end", start + 0.35))
+        amount = float(ev.get("amount", 0.04))
+        if start >= duration:
+            continue
+        end = min(duration, end)
+        try:
+            sub = video.subclip(start, end)
+            def local_scale(t, amount=amount, end=end, start=start):
+                p = clamp(t / max(0.01, end - start), 0.0, 1.0)
+                return 1.0 + amount * math.sin(math.pi * p)
+            zoomed = sub.fx(vfx.resize, local_scale) if vfx else sub
+            try:
+                zoomed = zoomed.crop(x_center=zoomed.w / 2, y_center=zoomed.h / 2, width=size[0], height=size[1])
+            except Exception:
+                pass
+            layers.append(zoomed.set_start(start).set_duration(end - start))
+        except Exception:
+            pass
+    try:
+        return CompositeVideoClip(layers, size=size).set_duration(duration)
+    except Exception:
+        return video
+
+
+def apply_keyword_zoom(video, words, niche=None, mode="SHORT", caption_mode=None, render_count=0, max_events=None, method="dynamic"):
+    if ZOOM_ENGINE_AVAILABLE and _zoom_engine_apply_keyword_zoom is not None and method == "zoom_engine":
+        try:
+            return _zoom_engine_apply_keyword_zoom(video, words, niche=niche, mode=mode, caption_mode=caption_mode, max_events=max_events or 12)
+        except Exception:
+            pass
+    events = build_keyword_zoom_plan(words, duration=clip_duration(video), niche=niche, mode=mode, render_count=render_count, max_events=max_events)
+    if method == "overlay":
+        return apply_keyword_zoom_overlay_method(video, events)
+    return apply_keyword_zoom_events(video, events)
+
+
+def build_keyword_report(words=None, duration=None, niche=None, mode="SHORT", render_count=0):
+    events = build_keyword_zoom_plan(words or [], duration=duration, niche=niche, mode=mode, render_count=render_count)
+    return {
+        "output_dir": str(OUTPUT_DIR),
+        "niche": _resolve_niche(niche),
+        "mode": _mode_key(mode),
+        "profile": _profile(niche=niche, mode=mode, render_count=render_count),
+        "keywords_count": len(_keywords(niche)),
+        "zoom_engine_available": ZOOM_ENGINE_AVAILABLE,
+        "events": events,
+        "event_count": len(events),
+    }
+
+
+def save_keyword_report(report, output_path=None):
+    output_path = Path(output_path or REPORT_DIR / "keyword_zoom_report.json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return str(output_path)
+
+
+class KeywordZoomEngine:
+    def __init__(self, niche=None, mode="SHORT", render_count=0):
+        self.niche = niche or "default"
+        self.mode = _mode_key(mode)
+        self.render_count = int(render_count or 0)
+
+    def plan(self, words, duration=None, max_events=None):
+        return build_keyword_zoom_plan(words, duration=duration, niche=self.niche, mode=self.mode, render_count=self.render_count, max_events=max_events)
+
+    def apply(self, video, words, max_events=None, method="dynamic"):
+        return apply_keyword_zoom(video, words, niche=self.niche, mode=self.mode, render_count=self.render_count, max_events=max_events, method=method)
+
+    def report(self, words=None, duration=None):
+        return build_keyword_report(words=words, duration=duration, niche=self.niche, mode=self.mode, render_count=self.render_count)
+
+
+def keyword_zoom(video, words, niche=None, mode="SHORT"):
+    return apply_keyword_zoom(video, words, niche=niche, mode=mode)
+
+
+def add_keyword_zoom(video, words, niche=None, mode="SHORT"):
+    return apply_keyword_zoom(video, words, niche=niche, mode=mode)
+
+
+def smart_keyword_zoom(video, words, niche=None, mode="SHORT"):
+    return apply_keyword_zoom(video, words, niche=niche, mode=mode)
+
+
+if __name__ == "__main__":
+    print(json.dumps(build_keyword_report(), indent=2))
+
+def _keyword_zoom_helper_1(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_2(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_3(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_4(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_5(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_6(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_7(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_8(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_9(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_10(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_11(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_12(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_13(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_14(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_15(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_16(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_17(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_18(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_19(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_20(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_21(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_22(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_23(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_24(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_25(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_26(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_27(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_28(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_29(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_30(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_31(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_32(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_33(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_34(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_35(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_36(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_37(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_38(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_39(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_40(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_41(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_42(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_43(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_44(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_45(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_46(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_47(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_48(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_49(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_50(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_51(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_52(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_53(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_54(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_55(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_56(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_57(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_58(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_59(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_60(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_61(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_62(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_63(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_64(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_65(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_66(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_67(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_68(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_69(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_70(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_71(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_72(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_73(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_74(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_75(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_76(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_77(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_78(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_79(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_80(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_81(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_82(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_83(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_84(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_85(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_86(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_87(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_88(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_89(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_90(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_91(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_92(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_93(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_94(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_95(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_96(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_97(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_98(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_99(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_100(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_101(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_102(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_103(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_104(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_105(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_106(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_107(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_108(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_109(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_110(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_111(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_112(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_113(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_114(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_115(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_116(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_117(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_118(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_119(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_120(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_121(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_122(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_123(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_124(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_125(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_126(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_127(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_128(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_129(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_130(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_131(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_132(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_133(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_134(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_135(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_136(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_137(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_138(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_139(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_140(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_141(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_142(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_143(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_144(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_145(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_146(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_147(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_148(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_149(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_150(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_151(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_152(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_153(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_154(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_155(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_156(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_157(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_158(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_159(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_160(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_161(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_162(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_163(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_164(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_165(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_166(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_167(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_168(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_169(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_170(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_171(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_172(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_173(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_174(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_175(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_176(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_177(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_178(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_179(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_180(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_181(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_182(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_183(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_184(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_185(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_186(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_187(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_188(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_189(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_190(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_191(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_192(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_193(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_194(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_195(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_196(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_197(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_198(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_199(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_200(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_201(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_202(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_203(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_204(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_205(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_206(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_207(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_208(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_209(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_210(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_211(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_212(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_213(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_214(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_215(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_216(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_217(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_218(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_219(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload
+
+
+def _keyword_zoom_helper_220(payload=None, fallback=None):
+    if payload is None:
+        return fallback
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, list):
+        return list(payload)
+    if isinstance(payload, tuple):
+        return tuple(payload)
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    return payload

@@ -1,0 +1,6 @@
+Can't find file (f'
+Can't find file ERROR
+Can't find file in
+Can't find file {fname}:{i}
+Can't find file -
+Can't find file {line.rstrip()[:80]}')
