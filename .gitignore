@@ -1,0 +1,7 @@
+venv/  
+__pycache__/  
+*.pyc  
+final_renders/  
+temp_assets/  
+*.mp4  
+*.wav 
