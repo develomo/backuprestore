@@ -1,7 +1,19 @@
-venv/  
-__pycache__/  
-*.pyc  
-final_renders/  
-temp_assets/  
-*.mp4  
-*.wav 
+```
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Backup files
+backup/
+```

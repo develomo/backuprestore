@@ -6,6 +6,7 @@ import json
 import shutil
 import random
 import subprocess
+import gc
 from pathlib import Path
 
 FFMPEG = r"D:/ffmpeg/bin/ffmpeg.exe"
@@ -19,23 +20,33 @@ SCALE_FILTER = f"scale={TARGET_W}:{TARGET_H}:force_original_aspect_ratio=increas
 CROP_FILTER = f"crop={TARGET_W}:{TARGET_H}"
 SIZE_ZP = f"{TARGET_W}x{TARGET_H}"  # Only for zoompan 's=' parameter
 
+# 🌡️ THERMAL SAFE MODE: Ultra-conservative settings to prevent laptop shutdown
+THERMAL_SAFE_MODE = True
+BATCH_SIZE_OVERRIDE = 4  # Force max 4 clips per batch (50% RAM reduction)
+CLIP_COOLDOWN = 0.5  # 0.5s pause between clips (was 0.3s)
+BATCH_COOLDOWN = 2.0  # 2.0s pause between batches (was 1.0s)
+FFMPEG_THREADS = 1 if THERMAL_SAFE_MODE else 2  # Ultra-low CPU usage
+
 PREMIUM_MOTIONS = {
-    "Slow Zoom In": f"zoompan=z='min(zoom+0.0008,1.12)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
-    "Slow Zoom Out": f"zoompan=z='if(eq(on,1),1.12,max(zoom-0.0008,1.0))':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
-    "Pan Left to Right": f"zoompan=z='1.1':d=1:x='if(eq(on,1),0,min(x+2,iw-iw/zoom))':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
-    "Pan Right to Left": f"zoompan=z='1.1':d=1:x='if(eq(on,1),iw-iw/zoom,max(x-2,0))':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
-    "Pan Top to Bottom": f"zoompan=z='1.1':d=1:x='iw/2-(iw/zoom/2)':y='if(eq(on,1),0,min(y+2,ih-ih/zoom))':s={SIZE_ZP}",
-    "Pan Bottom to Top": f"zoompan=z='1.1':d=1:x='iw/2-(iw/zoom/2)':y='if(eq(on,1),ih-ih/zoom,max(y-2,0))':s={SIZE_ZP}",
-    "Diagonal TL to BR": f"zoompan=z='1.08':d=1:x='if(eq(on,1),0,min(x+1.5,iw-iw/zoom))':y='if(eq(on,1),0,min(y+1.5,ih-ih/zoom))':s={SIZE_ZP}",
-    "Diagonal BR to TL": f"zoompan=z='1.08':d=1:x='if(eq(on,1),iw-iw/zoom,max(x-1.5,0))':y='if(eq(on,1),ih-ih/zoom,max(y-1.5,0))':s={SIZE_ZP}",
-    "Gentle Float": f"zoompan=z='1.05':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
-    "Cinematic Push": f"zoompan=z='min(zoom+0.0012,1.15)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Slow Zoom In": f"zoompan=z='min(zoom+0.0008,1.08)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Slow Zoom Out": f"zoompan=z='if(eq(on,1),1.08,max(zoom-0.0008,1.0))':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Pan Left to Right": f"zoompan=z='1.05':d=1:x='if(eq(on,1),0,min(x+1,iw-iw/zoom))':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Pan Right to Left": f"zoompan=z='1.05':d=1:x='if(eq(on,1),iw-iw/zoom,max(x-1,0))':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Pan Top to Bottom": f"zoompan=z='1.05':d=1:x='iw/2-(iw/zoom/2)':y='if(eq(on,1),0,min(y+1,ih-ih/zoom))':s={SIZE_ZP}",
+    "Pan Bottom to Top": f"zoompan=z='1.05':d=1:x='iw/2-(iw/zoom/2)':y='if(eq(on,1),ih-ih/zoom,max(y-1,0))':s={SIZE_ZP}",
+    "Gentle Float": f"zoompan=z='1.03':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
+    "Cinematic Push": f"zoompan=z='min(zoom+0.001,1.07)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={SIZE_ZP}",
 }
 
+# PROFESSIONAL FILM-GRADE TRANSITIONS ONLY
+# Distribution: 60% fade/dissolve, 25% smooth*, 10% radial, 5% fadewhite/fadeblack
 PREMIUM_TRANSITIONS = [
-    "fade", "dissolve", "smoothleft", "smoothright", "smoothup", "smoothdown",
-    "circleopen", "circleclose", "rectcrop", "circlecrop", "radial",
-    "pixelize", "wipeleft", "wiperight", "wipeup", "wipedown"
+    "fade", "fade", "fade", "fade", "fade", "fade",  # 6x fade (most common)
+    "dissolve", "dissolve", "dissolve", "dissolve", "dissolve", "dissolve",  # 6x dissolve
+    "smoothleft", "smoothleft", "smoothright", "smoothright",  # 4x smooth variants
+    "smoothup", "smoothdown",  # 2x more smooth
+    "radial", "radial",  # 2x radial (accent)
+    "fadewhite", "fadeblack"  # 2x dramatic (rare)
 ]
 
 COLOR_GRADES = {
@@ -64,20 +75,23 @@ def get_unique_sequence(options_list, length):
 
 def render_clip(clip_path, out_path, duration, motion_filter, color_grade, fps=TARGET_FPS):
     vf_str = ",".join([SCALE_FILTER, CROP_FILTER, f"fps={fps}", motion_filter, color_grade, "setsar=1"])
-    cmd = [FFMPEG, "-threads", "2", "-y", "-i", str(clip_path), "-vf", vf_str,
+    cmd = [FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(clip_path), "-vf", vf_str,
            "-c:v", "libx264", "-preset", "fast", "-crf", "26",
            "-r", str(fps), "-an", "-t", str(duration), str(out_path)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
         fallback_vf = f"{SCALE_FILTER},{CROP_FILTER},fps={fps},setsar=1"
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(clip_path), "-vf", fallback_vf,
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(clip_path), "-vf", fallback_vf,
                        "-c:v", "libx264", "-preset", "fast", "-crf", "26",
                        "-r", str(fps), "-an", "-t", str(duration), str(out_path)],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 🌡️ THERMAL COOLDOWN: Force garbage collection after each clip
+    gc.collect()
+    time.sleep(CLIP_COOLDOWN)
     return out_path
 
 
-def concat_with_transitions(clip_list, out_path, start_idx=0):
+def concat_with_transitions(clip_list, out_path, start_idx=0, clip_duration=7.0):
     if len(clip_list) == 1:
         shutil.copy2(clip_list[0], out_path)
         return []
@@ -91,21 +105,21 @@ def concat_with_transitions(clip_list, out_path, start_idx=0):
         filters.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={TARGET_FPS},format=yuv420p[v{i}]")
 
     current = "[v0]"
-    elapsed = 7.0
+    elapsed = clip_duration
     transition_times = []
 
     for i in range(1, len(clip_list)):
         trans_name = random.choice(PREMIUM_TRANSITIONS)
-        dur = random.uniform(0.5, 0.8)
+        dur = random.uniform(0.4, 0.7)  # Professional transition duration: 0.4s-0.7s
         offset = max(0.1, elapsed - dur)
         out_label = f"[x{i}]"
         transition_times.append(offset + dur / 2.0)
         print(f"  🎬 [TRANSITION] Clip {start_idx+i} -> {start_idx+i+1}: '{trans_name}' ({dur:.2f}s)")
         filters.append(f"{current}[v{i}]xfade=transition={trans_name}:duration={dur:.3f}:offset={offset:.3f}{out_label}")
         current = out_label
-        elapsed = elapsed + 7.0 - dur
+        elapsed = elapsed + clip_duration - dur  # Use actual clip_duration
 
-    cmd = [FFMPEG, "-threads", "2", "-y"] + inputs + [
+    cmd = [FFMPEG, "-threads", str(FFMPEG_THREADS), "-y"] + inputs + [
         "-filter_complex", ";".join(filters),
         "-map", current, "-an",
         "-c:v", "libx264", "-preset", "fast", "-crf", "26",
@@ -119,13 +133,15 @@ def concat_with_transitions(clip_list, out_path, start_idx=0):
             for c in clip_list:
                 safe_p = str(c.resolve()).replace("\\", "/").replace("'", "'\\''")
                 f.write(f"file '{safe_p}'\n")
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-f", "concat", "-safe", "0",
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-f", "concat", "-safe", "0",
                        "-i", str(list_file), "-c", "copy", str(out_path)],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             list_file.unlink()
         except Exception:
             pass
+    # 🌡️ THERMAL COOLDOWN: Force garbage collection after batch
+    gc.collect()
     return transition_times
 
 
@@ -140,6 +156,11 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
     out_p.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = out_p.parent / f"long_batch_temp_{int(time.time())}"
     temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 🌡️ THERMAL SAFE MODE: Override batch_size to prevent RAM crash
+    if THERMAL_SAFE_MODE:
+        batch_size = min(batch_size, BATCH_SIZE_OVERRIDE)
+        print(f"🌡️ [THERMAL SAFE MODE] Batch size reduced to {batch_size} for RAM safety")
 
     print("\n" + "=" * 70)
     print("🎥 PRODUCTION READY LONG VIDEO ENGINE ACTIVE")
@@ -159,7 +180,7 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
     total_voice_dur = orig_voice_dur
 
     try:
-        detect_cmd = [FFMPEG, "-threads", "2", "-i", str(voice_path), "-af",
+        detect_cmd = [FFMPEG, "-threads", str(FFMPEG_THREADS), "-i", str(voice_path), "-af",
                       "silencedetect=noise=-35dB:d=0.8", "-f", "null", "-"]
         result = subprocess.run(detect_cmd, capture_output=True, text=True)
         silence_starts = re.findall(r'silence_start:\s*([\d.]+)', result.stderr)
@@ -180,7 +201,7 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
 
             if af_parts:
                 af_str = ",".join(af_parts) + ",asetpts=PTS-STARTPTS"
-                subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(voice_path), "-af", af_str, str(trimmed_voice)],
+                subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(voice_path), "-af", af_str, str(trimmed_voice)],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if trimmed_voice.exists() and trimmed_voice.stat().st_size > 1000:
                     r2 = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
@@ -202,15 +223,17 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
     except Exception as e:
         print(f"    ⚠️ Silence detection error: {e}, using original")
 
-    # Calculate timing AFTER silence removal
-    clip_duration = random.uniform(6.5, 7.5)
-    clips_needed = int(total_voice_dur / clip_duration) + 1
-    total_dur = 1.5 + total_voice_dur + 2.0
+    # Calculate timing AFTER silence removal - FEATURE 5: Professional pacing
+    # Formula: clips_needed = round(voice_dur / 7.0), clip_dur = voice_dur / clips_needed
+    # This ensures total clips duration equals voice duration exactly
+    clips_needed = max(1, round(total_voice_dur / 7.0))
+    clip_duration = total_voice_dur / clips_needed if clips_needed > 0 else 7.0
+    total_dur = 1.5 + total_voice_dur + 2.0  # FEATURE 7: Outro exactly 2s after voice ends
 
     print(f"\n📊 [ANALYSIS]")
     print(f"  • Original Voice: {orig_voice_dur:.2f}s | Trimmed: {total_voice_dur:.2f}s")
     print(f"  • Target Duration: {total_dur:.2f}s ({total_dur/60:.1f} min)")
-    print(f"  • Clip Duration: {clip_duration:.2f}s (randomized 6.5-7.5s)")
+    print(f"  • Clip Duration: {clip_duration:.2f}s (calculated for exact voice match)")
     print(f"  • Clips Needed: {clips_needed} | Available: {len(clips)}")
 
     if len(clips) < clips_needed:
@@ -225,28 +248,28 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
     intro_vf = f"{SCALE_FILTER},{CROP_FILTER},fps={TARGET_FPS}"
     if intro_path and os.path.exists(str(intro_path)):
         print(f"\n🎬 [INTRO] Processing 1.5s intro...")
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(intro_path), "-vf", intro_vf,
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(intro_path), "-vf", intro_vf,
                        "-t", "1.5", "-c:v", "libx264", "-preset", "fast",
                        "-r", str(TARGET_FPS), "-an", str(intro_out)], check=True)
         print(f"  ✅ Intro processed")
     else:
         print(f"\n⚠️ [INTRO] Creating black screen")
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-f", "lavfi", "-i", f"color=c=black:s={TARGET_W}x{TARGET_H}:d=1.5",
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-f", "lavfi", "-i", f"color=c=black:s={TARGET_W}x{TARGET_H}:d=1.5",
                        "-c:v", "libx264", "-preset", "fast", "-r", str(TARGET_FPS), "-an", str(intro_out)], check=True)
 
-    # PROCESS CLIPS
+    # PROCESS CLIPS - FEATURE 5: Each clip uses calculated duration (NOT random)
     print(f"\n🎨 [MOTION ENGINE] Processing {len(clips)} clips...")
     rendered_clips = []
     motions = get_unique_sequence(list(PREMIUM_MOTIONS.keys()), len(clips))
     colors = get_unique_sequence(list(COLOR_GRADES.keys()), len(clips))
 
     for i, clip in enumerate(clips):
-        this_dur = random.uniform(6.5, 7.5)
+        this_dur = clip_duration  # Use calculated duration, NOT random
         out_clip = temp_dir / f"clip_{i:04d}.mp4"
         print(f"  🎥 [CLIP {i+1}/{len(clips)}] Motion: {motions[i]} | Color: {colors[i]} | Dur: {this_dur:.2f}s")
         render_clip(clip, out_clip, this_dur, PREMIUM_MOTIONS[motions[i]], COLOR_GRADES[colors[i]], TARGET_FPS)
         rendered_clips.append(out_clip)
-        time.sleep(0.3)  # 🌡️ THERMAL COOLDOWN: 0.3s pause between clips
+        # 🌡️ THERMAL COOLDOWN: Now using configurable CLIP_COOLDOWN (0.5s default)
 
     # CONCATENATE IN BATCHES
     print(f"\n🔀 [TRANSITION ENGINE] Merging in batches of {batch_size}...")
@@ -257,10 +280,10 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
         batch = rendered_clips[i:i+batch_size]
         batch_out = temp_dir / f"batch_{i//batch_size:03d}.mp4"
         print(f"  📦 [BATCH {i//batch_size + 1}] {len(batch)} clips")
-        tt = concat_with_transitions(batch, batch_out, start_idx=i)
+        tt = concat_with_transitions(batch, batch_out, start_idx=i, clip_duration=clip_duration)
         all_transition_times.extend(tt)
         intermediate_files.append(batch_out)
-        time.sleep(1.0)  # 🌡️ THERMAL COOLDOWN: 1s pause between batches
+        time.sleep(BATCH_COOLDOWN)  # 🌡️ THERMAL COOLDOWN: Now using configurable BATCH_COOLDOWN (2.0s default)
 
     body_out = temp_dir / "body.mp4"
     if len(intermediate_files) == 1:
@@ -271,7 +294,7 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
         with open(lf, "w", encoding="utf-8") as f:
             for c in intermediate_files:
                 f.write(f"file '{str(c.resolve()).replace(chr(92), '/')}'\n")
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-f", "concat", "-safe", "0", "-i", str(lf), "-c", "copy", str(body_out)], check=True)
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-f", "concat", "-safe", "0", "-i", str(lf), "-c", "copy", str(body_out)], check=True)
         try: lf.unlink()
         except: pass
 
@@ -280,12 +303,12 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
     outro_vf = f"{SCALE_FILTER},{CROP_FILTER},fps={TARGET_FPS}"
     if outro_path and os.path.exists(str(outro_path)):
         print(f"\n🎬 [OUTRO] Processing 2.0s outro...")
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(outro_path), "-vf", outro_vf,
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(outro_path), "-vf", outro_vf,
                        "-t", "2.0", "-c:v", "libx264", "-preset", "fast",
                        "-r", str(TARGET_FPS), "-an", str(outro_out)], check=True)
         print(f"  ✅ Outro processed")
     else:
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-f", "lavfi", "-i", f"color=c=black:s={TARGET_W}x{TARGET_H}:d=2.0",
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-f", "lavfi", "-i", f"color=c=black:s={TARGET_W}x{TARGET_H}:d=2.0",
                        "-c:v", "libx264", "-preset", "fast", "-r", str(TARGET_FPS), "-an", str(outro_out)], check=True)
 
     # ASSEMBLE
@@ -296,72 +319,89 @@ def render_long_batch_memory(voice_path, clips, output_path, music_path=None, sf
         f.write(f"file '{str(intro_out.resolve()).replace(chr(92), '/')}'\n")
         f.write(f"file '{str(body_out.resolve()).replace(chr(92), '/')}'\n")
         f.write(f"file '{str(outro_out.resolve()).replace(chr(92), '/')}'\n")
-    subprocess.run([FFMPEG, "-threads", "2", "-y", "-f", "concat", "-safe", "0", "-i", str(alf), "-c", "copy", str(assembled_out)], check=True)
+    subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-f", "concat", "-safe", "0", "-i", str(alf), "-c", "copy", str(assembled_out)], check=True)
     try: alf.unlink()
     except: pass
     print(f"  ✅ Assembly complete")
 
-    # LOGO (1.5s to voice_end)
+    # LOGO (1.5s to voice_end) - FEATURE 1: BOTTOM-LEFT position, 8% width
     current_video = assembled_out
     logo_end_time = 1.5 + total_voice_dur
     if custom_logo_path and os.path.exists(str(custom_logo_path)):
         print(f"\n🎨 [LOGO] Applying watermark (opacity={wm_opacity}, visible 1.5s-{logo_end_time:.1f}s)...")
         logo_out = temp_dir / "with_logo.mp4"
-        subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(current_video), "-i", str(custom_logo_path),
+        subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(current_video), "-i", str(custom_logo_path),
                        "-filter_complex",
-                       f"[1:v]scale=iw*0.12:-1,format=rgba,colorchannelmixer=aa={wm_opacity}[wm];"
-                       f"[0:v][wm]overlay=W-w-30:H-h-30:enable='between(t,1.5,{logo_end_time:.3f})'",
+                       f"[1:v]scale=iw*0.08:-1,format=rgba,colorchannelmixer=aa={wm_opacity}[wm];"
+                       f"[0:v][wm]overlay=30:H-h-30:enable='between(t,1.5,{logo_end_time:.3f})'",
                        "-c:v", "libx264", "-preset", "fast", "-crf", "26",
                        "-r", str(TARGET_FPS), "-c:a", "copy", str(logo_out)], check=True)
         current_video = logo_out
-        print(f"  ✅ Logo applied")
+        print(f"  ✅ Logo applied (BOTTOM-LEFT, 8% width)")
 
-    # SUBSCRIBE OVERLAY (420s-480s)
+    # SUBSCRIBE OVERLAY WITH GREEN SCREEN - FEATURE 2: chromakey support
     if subscribe_overlay and os.path.exists(str(subscribe_overlay)):
         if total_voice_dur > 420.0:
-            print(f"\n🔔 [SUBSCRIBE] Applying overlay at 7-8 minute mark...")
+            print(f"\n🔔 [SUBSCRIBE] Applying overlay at 7-8 minute mark with green screen support...")
             sub_out = temp_dir / "with_subscribe.mp4"
-            subprocess.run([FFMPEG, "-threads", "2", "-y", "-i", str(current_video), "-i", str(subscribe_overlay),
-                           "-filter_complex",
-                           f"[1:v]scale=240:-1,format=rgba[ov];"
-                           f"[0:v][ov]overlay=(main_w-overlay_w)/2:main_h-overlay_h-40:enable='between(t,420,480)'",
+            # Try chromakey first for green screen, fallback to normal overlay
+            subscribe_filter = (
+                f"[1:v]scale=240:-1,chromakey=0x00FF00:0.1:0.1,format=rgba[ov];"
+                f"[0:v][ov]overlay=(main_w-overlay_w)/2:main_h-overlay_h-40:enable='between(t,420,480)'"
+            )
+            r = subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(current_video), "-i", str(subscribe_overlay),
+                           "-filter_complex", subscribe_filter,
                            "-c:v", "libx264", "-preset", "fast", "-crf", "26",
-                           "-r", str(TARGET_FPS), "-c:a", "copy", str(sub_out)], check=True)
+                           "-r", str(TARGET_FPS), "-c:a", "copy", str(sub_out)], 
+                           capture_output=True, text=True)
+            if r.returncode != 0 or not os.path.exists(str(sub_out)) or os.path.getsize(str(sub_out)) < 1000:
+                # Fallback: normal overlay without chromakey
+                print(f"  ⚠️ Chromakey failed, using normal overlay...")
+                subscribe_filter_fallback = (
+                    f"[1:v]scale=240:-1,format=rgba[ov];"
+                    f"[0:v][ov]overlay=(main_w-overlay_w)/2:main_h-overlay_h-40:enable='between(t,420,480)'"
+                )
+                subprocess.run([FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(current_video), "-i", str(subscribe_overlay),
+                               "-filter_complex", subscribe_filter_fallback,
+                               "-c:v", "libx264", "-preset", "fast", "-crf", "26",
+                               "-r", str(TARGET_FPS), "-c:a", "copy", str(sub_out)], check=True)
             current_video = sub_out
-            print(f"  ✅ Subscribe overlay applied (7-8 min)")
+            print(f"  ✅ Subscribe overlay applied (7-8 min, centered, green screen support)")
         else:
             print(f"\n⚠️ Video too short for subscribe overlay")
 
-    # AUDIO ENGINE
-    print(f"\n🎵 [AUDIO ENGINE] Mixing Voice + Music + SFX...")
+    # AUDIO ENGINE - FEATURE 3 & 6: Professional voice processing chain
+    print(f"\n🎵 [AUDIO ENGINE] Mixing Voice + Music + SFX with professional processing...")
     voice_end_trim = 1.5 + total_voice_dur
-    cmd = [FFMPEG, "-threads", "2", "-y", "-i", str(current_video), "-i", str(trimmed_voice_path)]
-    filters = [f"[1:a]volume=1.5,highpass=f=90,lowpass=f=9500,acompressor=threshold=-19dB:ratio=2.5,"
-               f"alimiter=limit=0.97,adelay={int(1.5*1000)}|{int(1.5*1000)},atrim=0:{voice_end_trim:.3f},aresample=44100[v]"]
+    cmd = [FFMPEG, "-threads", str(FFMPEG_THREADS), "-y", "-i", str(current_video), "-i", str(trimmed_voice_path)]
+    # PROFESSIONAL VOICE CHAIN: highpass, lowpass, noise reduction, compression, limiting, loudnorm
+    filters = [f"[1:a]highpass=f=80,lowpass=f=12000,afftdn=nf=-25,acompressor=threshold=-20dB:ratio=3:attack=5:release=100,alimiter=limit=0.95,loudnorm=I=-16:TP=-1.5:LRA=11,volume=1.5,adelay={int(1.5*1000)}|{int(1.5*1000)},atrim=0:{voice_end_trim:.3f},aresample=44100[v]"]
     labels = ["[v]"]
     idx = 2
 
-    # BG Music SEAMLESS LOOP
+    # BG Music SEAMLESS LOOP - FEATURE 3: NO afade=t=out (causes 15s gap)
     if music_path and os.path.exists(str(music_path)):
-        print(f"  🎵 BG Music: seamless infinite loop (zero gaps)")
+        print(f"  🎵 BG Music: seamless infinite loop (volume 0.08, zero gaps)")
         cmd.extend(["-stream_loop", "-1", "-i", str(music_path)])
-        filters.append(f"[{idx}:a]volume=0.12,highpass=f=60,lowpass=f=11500,afade=t=in:st=1.5:d=2.0,"
+        # Lower volume to 0.08 as specified, remove afade=t=out to prevent gaps
+        filters.append(f"[{idx}:a]volume=0.08,highpass=f=60,lowpass=f=11500,afade=t=in:st=1.5:d=2.0,"
                       f"adelay={int(1.5*1000)}|{int(1.5*1000)},atrim=0:{voice_end_trim:.3f},aresample=44100[m]")
         labels.append("[m]")
         idx += 1
 
-    # SFX SYNCED TO TRANSITIONS
+    # SFX SYNCED TO TRANSITIONS - FEATURE 4: Use EXACT transition timestamps
     if sfx_files and len(sfx_files) > 0 and all_transition_times:
         sfx_path = str(sfx_files[0])
         if os.path.exists(sfx_path):
             n_bursts = min(len(all_transition_times), 40)
-            print(f"  🔊 {n_bursts} SFX bursts synced to transitions")
+            print(f"  🔊 {n_bursts} SFX bursts synced to ACTUAL transition timestamps (vol=0.35)")
             cmd.extend(["-i", sfx_path])
             src_labels = "".join(f"[sfx_src{i}]" for i in range(n_bursts))
             filters.append(f"[{idx}:a]volume=0.35,atrim=0:1.0,asetpts=PTS-STARTPTS,"
                           f"highpass=f=80,lowpass=f=13500,asplit={n_bursts}{src_labels}")
             hit_labels = []
             for i in range(n_bursts):
+                # Use EXACT transition timestamp from concat_with_transitions()
                 delay_ms = int((all_transition_times[i] + 1.5) * 1000)
                 filters.append(f"[sfx_src{i}]adelay={delay_ms}|{delay_ms}[sfxh{i}]")
                 hit_labels.append(f"[sfxh{i}]")
