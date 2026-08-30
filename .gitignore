@@ -1,6 +1,9 @@
 ```
 # Dependencies
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
 
 # Logs and temp files
 *.log
@@ -10,10 +13,6 @@ __pycache__/
 .env
 .env.local
 *.env.*
-
-# Editors
-.vscode/
-.idea/
 
 # Backup files
 backup/
